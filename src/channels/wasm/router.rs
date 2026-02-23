@@ -14,7 +14,6 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -43,42 +42,6 @@ pub struct WasmChannelRouter {
     secrets: RwLock<HashMap<String, String>>,
     /// Webhook secret header names by channel name (e.g., "X-Telegram-Bot-Api-Secret-Token").
     secret_headers: RwLock<HashMap<String, String>>,
-}
-
-fn verify_discord_signature(
-    public_key_hex: &str,
-    signature_hex: &str,
-    timestamp: &str,
-    body: &[u8],
-) -> bool {
-    let public_key_bytes = match hex::decode(public_key_hex.trim()) {
-        Ok(bytes) => bytes,
-        Err(_) => return false,
-    };
-    let public_key_arr: [u8; 32] = match public_key_bytes.try_into() {
-        Ok(arr) => arr,
-        Err(_) => return false,
-    };
-    let verifying_key = match VerifyingKey::from_bytes(&public_key_arr) {
-        Ok(key) => key,
-        Err(_) => return false,
-    };
-
-    let signature_bytes = match hex::decode(signature_hex.trim()) {
-        Ok(bytes) => bytes,
-        Err(_) => return false,
-    };
-    let signature_arr: [u8; 64] = match signature_bytes.try_into() {
-        Ok(arr) => arr,
-        Err(_) => return false,
-    };
-    let signature = Signature::from_bytes(&signature_arr);
-
-    let mut signed_message = Vec::with_capacity(timestamp.len() + body.len());
-    signed_message.extend_from_slice(timestamp.as_bytes());
-    signed_message.extend_from_slice(body);
-
-    verifying_key.verify(&signed_message, &signature).is_ok()
 }
 
 impl WasmChannelRouter {
@@ -350,28 +313,7 @@ async fn webhook_handler(
 
         match provided_secret {
             Some(secret) => {
-                let secret_ok = if channel_name == "discord"
-                    && secret_header_name.eq_ignore_ascii_case("X-Signature-Ed25519")
-                {
-                    let timestamp = headers
-                        .get("X-Signature-Timestamp")
-                        .and_then(|v| v.to_str().ok());
-                    match timestamp {
-                        Some(ts) => {
-                            let public_key =
-                                state.router.secrets.read().await.get(channel_name).cloned();
-                            match public_key {
-                                Some(pk) => verify_discord_signature(&pk, &secret, ts, &body),
-                                None => false,
-                            }
-                        }
-                        None => false,
-                    }
-                } else {
-                    state.router.validate_secret(channel_name, &secret).await
-                };
-
-                if !secret_ok {
+                if !state.router.validate_secret(channel_name, &secret).await {
                     tracing::warn!(
                         channel = %channel_name,
                         "Webhook secret validation failed"
@@ -545,8 +487,6 @@ pub fn create_wasm_channel_router(
 mod tests {
     use std::sync::Arc;
 
-    use ed25519_dalek::{Signer, SigningKey};
-
     use crate::channels::wasm::capabilities::ChannelCapabilities;
     use crate::channels::wasm::router::{RegisteredEndpoint, WasmChannelRouter};
     use crate::channels::wasm::runtime::{
@@ -705,39 +645,4 @@ mod tests {
         assert_eq!(router.get_secret_header("slack").await, "X-Webhook-Secret");
     }
 
-    #[test]
-    fn test_verify_discord_signature_valid_and_invalid() {
-        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
-        let verifying_key = signing_key.verifying_key();
-        let public_key_hex = hex::encode(verifying_key.to_bytes());
-        let timestamp = "1700000000";
-        let body = br#"{"type":1}"#;
-
-        let mut signed = Vec::new();
-        signed.extend_from_slice(timestamp.as_bytes());
-        signed.extend_from_slice(body);
-        let signature = signing_key.sign(&signed);
-        let signature_hex = hex::encode(signature.to_bytes());
-
-        assert!(super::verify_discord_signature(
-            &public_key_hex,
-            &signature_hex,
-            timestamp,
-            body
-        ));
-
-        assert!(!super::verify_discord_signature(
-            &public_key_hex,
-            &signature_hex,
-            "1700000001",
-            body
-        ));
-
-        assert!(!super::verify_discord_signature(
-            &public_key_hex,
-            "deadbeef",
-            timestamp,
-            body
-        ));
-    }
 }

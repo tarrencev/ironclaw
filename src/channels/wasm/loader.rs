@@ -255,6 +255,18 @@ impl LoadedChannel {
             .map(|f| f.webhook_secret_name())
             .unwrap_or_else(|| format!("{}_webhook_secret", self.channel.channel_name()))
     }
+
+    /// Whether the host should enforce webhook secret validation.
+    ///
+    /// Defaults to true. Channels can opt out and perform their own verification
+    /// by setting `config.host_validates_webhook` to false in capabilities.
+    pub fn host_validates_webhook(&self) -> bool {
+        self.capabilities_file
+            .as_ref()
+            .and_then(|f| f.config.get("host_validates_webhook"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    }
 }
 
 /// Results from loading multiple channels.

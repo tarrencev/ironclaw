@@ -38,6 +38,7 @@
     }
   },
   "config": {
+    "host_validates_webhook": false,
     "require_signature_verification": true,
     "polling_enabled": false,
     "poll_interval_ms": 30000,

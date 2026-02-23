@@ -1148,10 +1148,10 @@ async fn main() -> anyhow::Result<()> {
                                 None
                             };
 
-                            // Discord endpoint signature verification needs the app public key.
-                            // If not in encrypted secrets, allow env-based fallback.
-                            if webhook_secret.is_none() && channel_name == "discord" {
-                                webhook_secret = std::env::var("DISCORD_PUBLIC_KEY")
+                            // Generic env fallback for webhook secrets when not present in the
+                            // encrypted store (e.g., DISCORD_PUBLIC_KEY for discord_public_key).
+                            if webhook_secret.is_none() {
+                                webhook_secret = std::env::var(secret_name.to_ascii_uppercase())
                                     .ok()
                                     .map(|v| v.trim().to_string())
                                     .filter(|v| !v.is_empty());
@@ -1160,12 +1160,19 @@ async fn main() -> anyhow::Result<()> {
                             let secret_header =
                                 loaded.webhook_secret_header().map(|s| s.to_string());
 
+                            let host_validates_webhook = loaded.host_validates_webhook();
+                            let router_webhook_secret = if host_validates_webhook {
+                                webhook_secret.clone()
+                            } else {
+                                None
+                            };
+
                             let webhook_path = format!("/webhook/{}", channel_name);
                             let endpoints = vec![RegisteredEndpoint {
                                 channel_name: channel_name.clone(),
                                 path: webhook_path.clone(),
                                 methods: vec!["POST".to_string()],
-                                require_secret: webhook_secret.is_some(),
+                                require_secret: router_webhook_secret.is_some(),
                             }];
 
                             let channel_arc = Arc::new(loaded.channel);
@@ -1211,8 +1218,9 @@ async fn main() -> anyhow::Result<()> {
 
                             tracing::info!(
                                 channel = %channel_name,
-                                has_webhook_secret = webhook_secret.is_some(),
+                                has_webhook_secret = router_webhook_secret.is_some(),
                                 secret_header = ?secret_header,
+                                host_validates_webhook = host_validates_webhook,
                                 "Registering channel with router"
                             );
 
@@ -1220,7 +1228,7 @@ async fn main() -> anyhow::Result<()> {
                                 .register(
                                     Arc::clone(&channel_arc),
                                     endpoints,
-                                    webhook_secret.clone(),
+                                    router_webhook_secret,
                                     secret_header,
                                 )
                                 .await;

@@ -23,6 +23,9 @@ wit_bindgen::generate!({
     path: "../../wit/channel.wit",
 });
 
+use std::collections::HashMap;
+
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use exports::near::agent::channel::{
@@ -128,6 +131,10 @@ struct DiscordChannelAuthor {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DiscordRuntimeConfig {
+    #[serde(default = "default_require_signature_verification")]
+    require_signature_verification: bool,
+    #[serde(default)]
+    webhook_secret: Option<String>,
     #[serde(default)]
     polling_enabled: bool,
     #[serde(default = "default_poll_interval_ms")]
@@ -138,6 +145,10 @@ struct DiscordRuntimeConfig {
 
 fn default_poll_interval_ms() -> u32 {
     30_000
+}
+
+fn default_require_signature_verification() -> bool {
+    true
 }
 
 /// Metadata stored with emitted messages for response routing.
@@ -178,6 +189,8 @@ impl Guest for DiscordChannel {
                 &format!("Invalid config JSON, using defaults: {}", e),
             );
             DiscordRuntimeConfig {
+                require_signature_verification: default_require_signature_verification(),
+                webhook_secret: None,
                 polling_enabled: false,
                 poll_interval_ms: default_poll_interval_ms(),
                 mention_channel_ids: Vec::new(),
@@ -193,7 +206,7 @@ impl Guest for DiscordChannel {
             http_endpoints: vec![HttpEndpointConfig {
                 path: "/webhook/discord".to_string(),
                 methods: vec!["POST".to_string()],
-                require_secret: true,
+                require_secret: false,
             }],
             poll: if config.polling_enabled {
                 Some(PollConfig {
@@ -207,6 +220,19 @@ impl Guest for DiscordChannel {
     }
 
     fn on_http_request(req: IncomingHttpRequest) -> OutgoingHttpResponse {
+        let config = load_runtime_config();
+        let headers: HashMap<String, String> =
+            serde_json::from_str(&req.headers_json).unwrap_or_default();
+        if config.require_signature_verification
+            && !verify_discord_request_signature(headers, &req.body, config.webhook_secret.as_deref())
+        {
+            channel_host::log(
+                channel_host::LogLevel::Warn,
+                "Discord signature verification failed",
+            );
+            return json_response(401, serde_json::json!({"error": "Invalid signature"}));
+        }
+
         let body_str = match std::str::from_utf8(&req.body) {
             Ok(s) => s,
             Err(_) => {
@@ -369,6 +395,8 @@ fn load_runtime_config() -> DiscordRuntimeConfig {
     channel_host::workspace_read("config.json")
         .and_then(|raw| serde_json::from_str::<DiscordRuntimeConfig>(&raw).ok())
         .unwrap_or(DiscordRuntimeConfig {
+            require_signature_verification: default_require_signature_verification(),
+            webhook_secret: None,
             polling_enabled: false,
             poll_interval_ms: default_poll_interval_ms(),
             mention_channel_ids: Vec::new(),
@@ -590,6 +618,58 @@ fn discord_auth_headers_json(include_content_type: bool) -> String {
         })
         .to_string()
     }
+}
+
+fn verify_discord_request_signature(
+    headers: HashMap<String, String>,
+    body: &[u8],
+    public_key_hex: Option<&str>,
+) -> bool {
+    let Some(public_key_hex) = public_key_hex.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let Some(signature_hex) = header_case_insensitive(&headers, "x-signature-ed25519") else {
+        return false;
+    };
+    let Some(timestamp) = header_case_insensitive(&headers, "x-signature-timestamp") else {
+        return false;
+    };
+
+    let public_key_bytes = match hex::decode(public_key_hex) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let public_key_arr: [u8; 32] = match public_key_bytes.try_into() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let verifying_key = match VerifyingKey::from_bytes(&public_key_arr) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let sig_bytes = match hex::decode(signature_hex.trim()) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let sig_arr: [u8; 64] = match sig_bytes.try_into() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let signature = Signature::from_bytes(&sig_arr);
+
+    let mut signed_message = Vec::with_capacity(timestamp.len() + body.len());
+    signed_message.extend_from_slice(timestamp.as_bytes());
+    signed_message.extend_from_slice(body);
+
+    verifying_key.verify(&signed_message, &signature).is_ok()
+}
+
+fn header_case_insensitive<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
 }
 
 fn handle_slash_command(interaction: &DiscordInteraction) {
