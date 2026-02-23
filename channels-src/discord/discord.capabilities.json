@@ -1,7 +1,7 @@
 {
   "type": "channel",
   "name": "discord",
-  "description": "Discord Gateway/Webhook channel for handling slash commands, buttons, and messages",
+  "description": "Discord webhook channel for slash commands, components, and optional mention polling",
   "capabilities": {
     "http": {
       "allowlist": [
@@ -26,10 +26,6 @@
       "allowed_paths": ["/webhook/discord"],
       "allow_polling": true,
       "callback_timeout_secs": 45,
-      "webhook": {
-        "secret_header": "X-Signature-Ed25519",
-        "secret_name": "discord_public_key"
-      },
       "workspace_prefix": "channels/discord/",
       "emit_rate_limit": {
         "messages_per_minute": 100,
@@ -38,8 +34,8 @@
     }
   },
   "config": {
-    "host_validates_webhook": false,
     "require_signature_verification": true,
+    "webhook_secret": null,
     "polling_enabled": false,
     "poll_interval_ms": 30000,
     "mention_channel_ids": []

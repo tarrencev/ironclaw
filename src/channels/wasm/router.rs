@@ -644,5 +644,4 @@ mod tests {
             .await;
         assert_eq!(router.get_secret_header("slack").await, "X-Webhook-Secret");
     }
-
 }

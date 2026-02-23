@@ -8,8 +8,8 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use ironclaw::{
     agent::{Agent, AgentDeps, SessionManager},
     channels::{
-        ChannelManager, GatewayChannel, HttpChannel, RealtimeGatewayChannel,
-        RealtimeGatewayConfig, ReplChannel, WebhookServer, WebhookServerConfig,
+        ChannelManager, GatewayChannel, HttpChannel, ReplChannel, WebhookServer,
+        WebhookServerConfig,
         wasm::{
             RegisteredEndpoint, SharedWasmChannel, WasmChannelLoader, WasmChannelRouter,
             WasmChannelRuntime, WasmChannelRuntimeConfig, create_wasm_channel_router,
@@ -1138,7 +1138,7 @@ async fn main() -> anyhow::Result<()> {
 
                             let secret_name = loaded.webhook_secret_name();
 
-                            let mut webhook_secret = if let Some(ref secrets) = secrets_store {
+                            let webhook_secret = if let Some(ref secrets) = secrets_store {
                                 secrets
                                     .get_decrypted("default", &secret_name)
                                     .await
@@ -1148,31 +1148,15 @@ async fn main() -> anyhow::Result<()> {
                                 None
                             };
 
-                            // Generic env fallback for webhook secrets when not present in the
-                            // encrypted store (e.g., DISCORD_PUBLIC_KEY for discord_public_key).
-                            if webhook_secret.is_none() {
-                                webhook_secret = std::env::var(secret_name.to_ascii_uppercase())
-                                    .ok()
-                                    .map(|v| v.trim().to_string())
-                                    .filter(|v| !v.is_empty());
-                            }
-
                             let secret_header =
                                 loaded.webhook_secret_header().map(|s| s.to_string());
-
-                            let host_validates_webhook = loaded.host_validates_webhook();
-                            let router_webhook_secret = if host_validates_webhook {
-                                webhook_secret.clone()
-                            } else {
-                                None
-                            };
 
                             let webhook_path = format!("/webhook/{}", channel_name);
                             let endpoints = vec![RegisteredEndpoint {
                                 channel_name: channel_name.clone(),
                                 path: webhook_path.clone(),
                                 methods: vec!["POST".to_string()],
-                                require_secret: router_webhook_secret.is_some(),
+                                require_secret: webhook_secret.is_some(),
                             }];
 
                             let channel_arc = Arc::new(loaded.channel);
@@ -1218,9 +1202,8 @@ async fn main() -> anyhow::Result<()> {
 
                             tracing::info!(
                                 channel = %channel_name,
-                                has_webhook_secret = router_webhook_secret.is_some(),
+                                has_webhook_secret = webhook_secret.is_some(),
                                 secret_header = ?secret_header,
-                                host_validates_webhook = host_validates_webhook,
                                 "Registering channel with router"
                             );
 
@@ -1228,7 +1211,7 @@ async fn main() -> anyhow::Result<()> {
                                 .register(
                                     Arc::clone(&channel_arc),
                                     endpoints,
-                                    router_webhook_secret,
+                                    webhook_secret.clone(),
                                     secret_header,
                                 )
                                 .await;
@@ -1294,63 +1277,6 @@ async fn main() -> anyhow::Result<()> {
     // Add HTTP channel if configured and not CLI-only mode.
     // Extract its routes for the unified server; the channel itself just
     // provides the mpsc stream.
-    if !cli.cli_only {
-        let discord_gateway_enabled = std::env::var("DISCORD_GATEWAY_ENABLED")
-            .ok()
-            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false);
-        if discord_gateway_enabled {
-            let token_from_env = std::env::var("DISCORD_BOT_TOKEN")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            let token_from_secrets = if token_from_env.is_none() {
-                if let Some(ref secrets) = secrets_store {
-                    secrets
-                        .get_decrypted("default", "discord_bot_token")
-                        .await
-                        .ok()
-                        .map(|s| s.expose().to_string())
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            if let Some(token) = token_from_env.or(token_from_secrets) {
-                let mention_channel_ids = std::env::var("DISCORD_MENTION_CHANNEL_IDS")
-                    .ok()
-                    .map(|raw| {
-                        raw.split(',')
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-
-                match RealtimeGatewayChannel::new(RealtimeGatewayConfig {
-                    token,
-                    mention_channel_ids,
-                }) {
-                    Ok(discord_gateway) => {
-                        channels.add(Box::new(discord_gateway));
-                        channel_names.push("discord-gateway".to_string());
-                        tracing::info!("Discord gateway mention channel enabled");
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to initialize Discord gateway channel: {}", e);
-                    }
-                }
-            } else {
-                tracing::warn!(
-                    "DISCORD_GATEWAY_ENABLED=true but no Discord bot token found \
-                     (set DISCORD_BOT_TOKEN or discord_bot_token secret)"
-                );
-            }
-        }
-    }
-
     let mut webhook_server_addr: Option<std::net::SocketAddr> = None;
     if !cli.cli_only
         && let Some(ref http_config) = config.channels.http

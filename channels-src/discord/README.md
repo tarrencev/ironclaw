@@ -21,11 +21,10 @@ WASM channel for Discord integration - handle slash commands and button interact
    ironclaw secret set discord_bot_token YOUR_BOT_TOKEN
    ```
 
-   **Note:** The `discord_bot_token` secret is the only value read directly by this
-   Discord channel WASM component. The `discord_app_id` and `discord_public_key`
-   secrets are used by the IronClaw host (for example, to verify Discord
-   interaction signatures and manage slash command registration) and are not
-   accessed from the WASM module itself.
+   **Note:** The `discord_bot_token` secret is used for Discord REST API calls.
+   Interaction signature verification is performed inside the Discord channel
+   module and uses the channel config field `webhook_secret` (set this to your
+   Discord app public key hex).
 
 ## Discord Configuration
 
@@ -87,6 +86,21 @@ If an internal error occurs (e.g., metadata serialization failure), the tool att
 Check the host logs for detailed error information.
 
 ## Advanced Usage
+### Mention Polling
+
+The Discord channel can also poll configured channels for `@bot` mentions.
+
+Example channel config:
+
+```json
+{
+  "require_signature_verification": true,
+  "webhook_secret": "YOUR_DISCORD_PUBLIC_KEY_HEX",
+  "polling_enabled": true,
+  "poll_interval_ms": 30000,
+  "mention_channel_ids": ["123456789012345678"]
+}
+```
 
 ### Embeds
 
@@ -96,8 +110,9 @@ To send embeds, include an `embeds` array in the `metadata_json` field of the ag
 
 ### "Invalid Signature"
 
-- Check that `discord_public_key` is set correctly in IronClaw secrets.
-- This validation happens on the host before reaching the WASM.
+- Check that `webhook_secret` is set to your Discord app public key hex in the
+  Discord channel config.
+- Validation happens inside the Discord WASM channel.
 
 ### "401 Unauthorized"
 
