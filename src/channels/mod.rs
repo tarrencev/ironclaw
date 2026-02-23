@@ -28,18 +28,18 @@
 //! See the [`wasm`] module for details.
 
 mod channel;
-mod discord_gateway;
 mod http;
 mod manager;
+mod realtime_gateway;
 mod repl;
 pub mod wasm;
 pub mod web;
 mod webhook_server;
 
 pub use channel::{Channel, IncomingMessage, MessageStream, OutgoingResponse, StatusUpdate};
-pub use discord_gateway::{DiscordGatewayChannel, DiscordGatewayConfig};
 pub use http::HttpChannel;
 pub use manager::ChannelManager;
+pub use realtime_gateway::{RealtimeGatewayChannel, RealtimeGatewayConfig};
 pub use repl::ReplChannel;
 pub use web::GatewayChannel;
 pub use webhook_server::{WebhookServer, WebhookServerConfig};

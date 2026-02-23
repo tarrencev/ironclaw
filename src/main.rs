@@ -8,8 +8,8 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use ironclaw::{
     agent::{Agent, AgentDeps, SessionManager},
     channels::{
-        ChannelManager, DiscordGatewayChannel, DiscordGatewayConfig, GatewayChannel, HttpChannel,
-        ReplChannel, WebhookServer, WebhookServerConfig,
+        ChannelManager, GatewayChannel, HttpChannel, RealtimeGatewayChannel,
+        RealtimeGatewayConfig, ReplChannel, WebhookServer, WebhookServerConfig,
         wasm::{
             RegisteredEndpoint, SharedWasmChannel, WasmChannelLoader, WasmChannelRouter,
             WasmChannelRuntime, WasmChannelRuntimeConfig, create_wasm_channel_router,
@@ -1329,7 +1329,7 @@ async fn main() -> anyhow::Result<()> {
                     })
                     .unwrap_or_default();
 
-                match DiscordGatewayChannel::new(DiscordGatewayConfig {
+                match RealtimeGatewayChannel::new(RealtimeGatewayConfig {
                     token,
                     mention_channel_ids,
                 }) {

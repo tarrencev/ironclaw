@@ -27,20 +27,20 @@ const INTENT_DIRECT_MESSAGES: u64 = 1 << 12;
 const INTENT_MESSAGE_CONTENT: u64 = 1 << 15;
 
 #[derive(Debug, Clone)]
-pub struct DiscordGatewayConfig {
+pub struct RealtimeGatewayConfig {
     pub token: String,
     pub mention_channel_ids: Vec<String>,
 }
 
-pub struct DiscordGatewayChannel {
-    config: DiscordGatewayConfig,
+pub struct RealtimeGatewayChannel {
+    config: RealtimeGatewayConfig,
     tx: Arc<RwLock<Option<mpsc::Sender<IncomingMessage>>>>,
     task: Arc<RwLock<Option<JoinHandle<()>>>>,
     http: reqwest::Client,
 }
 
-impl DiscordGatewayChannel {
-    pub fn new(config: DiscordGatewayConfig) -> Result<Self, ChannelError> {
+impl RealtimeGatewayChannel {
+    pub fn new(config: RealtimeGatewayConfig) -> Result<Self, ChannelError> {
         let mut headers = HeaderMap::new();
         let auth = format!("Bot {}", config.token);
         let auth_value = HeaderValue::from_str(&auth).map_err(|e| ChannelError::StartupFailed {
@@ -300,7 +300,7 @@ async fn run_gateway_session(
 }
 
 #[async_trait]
-impl Channel for DiscordGatewayChannel {
+impl Channel for RealtimeGatewayChannel {
     fn name(&self) -> &str {
         CHANNEL_NAME
     }
