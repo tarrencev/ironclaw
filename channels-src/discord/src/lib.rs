@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use exports::near::agent::channel::{
     AgentResponse, ChannelConfig, Guest, HttpEndpointConfig, IncomingHttpRequest,
-    OutgoingHttpResponse, StatusUpdate,
+    OutgoingHttpResponse, PollConfig, StatusUpdate,
 };
 use near::agent::channel_host::{self, EmittedMessage};
 
@@ -105,6 +105,41 @@ struct DiscordMessage {
     author: DiscordUser,
 }
 
+#[derive(Debug, Deserialize)]
+struct DiscordChannelMessage {
+    id: String,
+    content: String,
+    channel_id: String,
+    author: DiscordChannelAuthor,
+    #[serde(default)]
+    mentions: Vec<DiscordUser>,
+    #[serde(default)]
+    webhook_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordChannelAuthor {
+    id: String,
+    username: String,
+    global_name: Option<String>,
+    #[serde(default)]
+    bot: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiscordRuntimeConfig {
+    #[serde(default)]
+    polling_enabled: bool,
+    #[serde(default = "default_poll_interval_ms")]
+    poll_interval_ms: u32,
+    #[serde(default)]
+    mention_channel_ids: Vec<String>,
+}
+
+fn default_poll_interval_ms() -> u32 {
+    30_000
+}
+
 /// Metadata stored with emitted messages for response routing.
 #[derive(Debug, Serialize, Deserialize)]
 struct DiscordMessageMetadata {
@@ -112,68 +147,46 @@ struct DiscordMessageMetadata {
     channel_id: String,
 
     /// Interaction ID for followups
-    interaction_id: String,
+    #[serde(default)]
+    interaction_id: Option<String>,
 
     /// Interaction token for responding
-    token: String,
+    #[serde(default)]
+    token: Option<String>,
 
     /// Application ID
-    application_id: String,
+    #[serde(default)]
+    application_id: Option<String>,
+
+    /// Source message ID when handling mention-poll events.
+    #[serde(default)]
+    source_message_id: Option<String>,
 
     /// Thread ID (for forum threads)
     thread_id: Option<String>,
-}
-
-/// Workspace path for persisting owner_id across WASM callbacks.
-const OWNER_ID_PATH: &str = "state/owner_id";
-/// Workspace path for persisting dm_policy across WASM callbacks.
-const DM_POLICY_PATH: &str = "state/dm_policy";
-/// Workspace path for persisting allow_from (JSON array) across WASM callbacks.
-const ALLOW_FROM_PATH: &str = "state/allow_from";
-/// Channel name for pairing store (used by pairing host APIs).
-const CHANNEL_NAME: &str = "discord";
-
-/// Channel configuration from capabilities file.
-#[derive(Debug, Deserialize)]
-struct DiscordConfig {
-    #[serde(default)]
-    #[allow(dead_code)]
-    require_signature_verification: bool,
-    #[serde(default)]
-    owner_id: Option<String>,
-    #[serde(default)]
-    dm_policy: Option<String>,
-    #[serde(default)]
-    allow_from: Option<Vec<String>>,
 }
 
 struct DiscordChannel;
 
 impl Guest for DiscordChannel {
     fn on_start(config_json: String) -> Result<ChannelConfig, String> {
-        let config: DiscordConfig = serde_json::from_str(&config_json)
-            .map_err(|e| format!("Failed to parse config: {}", e))?;
-
         channel_host::log(channel_host::LogLevel::Info, "Discord channel starting");
 
-        // Persist owner_id so subsequent callbacks can read it
-        if let Some(ref owner_id) = config.owner_id {
-            let _ = channel_host::workspace_write(OWNER_ID_PATH, owner_id);
+        let config = serde_json::from_str::<DiscordRuntimeConfig>(&config_json).unwrap_or_else(|e| {
             channel_host::log(
-                channel_host::LogLevel::Info,
-                &format!("Owner restriction enabled: user {}", owner_id),
+                channel_host::LogLevel::Warn,
+                &format!("Invalid config JSON, using defaults: {}", e),
             );
-        } else {
-            let _ = channel_host::workspace_write(OWNER_ID_PATH, "");
+            DiscordRuntimeConfig {
+                polling_enabled: false,
+                poll_interval_ms: default_poll_interval_ms(),
+                mention_channel_ids: Vec::new(),
+            }
+        });
+
+        if let Ok(serialized) = serde_json::to_string(&config) {
+            let _ = channel_host::workspace_write("config.json", &serialized);
         }
-
-        // Persist dm_policy and allow_from for DM pairing
-        let dm_policy = config.dm_policy.as_deref().unwrap_or("pairing");
-        let _ = channel_host::workspace_write(DM_POLICY_PATH, dm_policy);
-
-        let allow_from_json = serde_json::to_string(&config.allow_from.unwrap_or_default())
-            .unwrap_or_else(|_| "[]".to_string());
-        let _ = channel_host::workspace_write(ALLOW_FROM_PATH, &allow_from_json);
 
         Ok(ChannelConfig {
             display_name: "Discord".to_string(),
@@ -182,7 +195,14 @@ impl Guest for DiscordChannel {
                 methods: vec!["POST".to_string()],
                 require_secret: true,
             }],
-            poll: None,
+            poll: if config.polling_enabled {
+                Some(PollConfig {
+                    interval_ms: config.poll_interval_ms.max(30_000),
+                    enabled: true,
+                })
+            } else {
+                None
+            },
         })
     }
 
@@ -214,21 +234,16 @@ impl Guest for DiscordChannel {
 
             // Application Command (slash command)
             2 => {
-                if handle_slash_command(&interaction) {
-                    json_response(200, serde_json::json!({"type": 5}))
-                } else {
-                    // Permission denied — ephemeral response
-                    json_response(
-                        200,
-                        serde_json::json!({
-                            "type": 4,
-                            "data": {
-                                "content": "You are not authorized to use this bot.",
-                                "flags": 64
-                            }
-                        }),
-                    )
-                }
+                handle_slash_command(&interaction);
+                json_response(
+                    200,
+                    serde_json::json!({
+                        "type": 5,
+                        "data": {
+                            "content": "🤔 Thinking..."
+                        }
+                    }),
+                )
             }
 
             // Message Component (buttons, selects)
@@ -252,24 +267,18 @@ impl Guest for DiscordChannel {
         }
     }
 
-    fn on_poll() {}
+    fn on_poll() {
+        poll_for_mentions();
+    }
 
     fn on_respond(response: AgentResponse) -> Result<(), String> {
         let metadata: DiscordMessageMetadata = serde_json::from_str(&response.metadata_json)
             .map_err(|e| format!("Failed to parse metadata: {}", e))?;
 
-        // Use webhook endpoint for followup
-        let url = format!(
-            "https://discord.com/api/v10/webhooks/{}/{}",
-            metadata.application_id, metadata.token
-        );
-
         // Truncate content to 2000 characters to comply with Discord limits
         let content = truncate_message(&response.content);
 
-        let mut payload = serde_json::json!({
-            "content": content,
-        });
+        let mut payload = serde_json::json!({ "content": content });
 
         // Check for embeds in metadata
         if let Ok(meta_json) = serde_json::from_str::<serde_json::Value>(&response.metadata_json) {
@@ -285,29 +294,45 @@ impl Guest for DiscordChannel {
             "Content-Type": "application/json"
         });
 
-        let result = channel_host::http_request(
-            "POST",
-            &url,
-            &headers.to_string(),
-            Some(&payload_bytes),
-            None,
-        );
+        let (method, url) = if let (Some(application_id), Some(token)) =
+            (metadata.application_id.as_ref(), metadata.token.as_ref())
+        {
+            (
+                "PATCH",
+                format!(
+                    "https://discord.com/api/v10/webhooks/{}/{}/messages/@original",
+                    application_id, token
+                ),
+            )
+        } else if let Some(source_message_id) = metadata.source_message_id.as_ref() {
+            payload["message_reference"] = serde_json::json!({
+                "message_id": source_message_id
+            });
+            payload["allowed_mentions"] = serde_json::json!({
+                "replied_user": true
+            });
+            let mention_payload = serde_json::to_vec(&payload)
+                .map_err(|e| format!("Failed to serialize mention payload: {}", e))?;
+            let mention_url = format!(
+                "https://discord.com/api/v10/channels/{}/messages",
+                metadata.channel_id
+            );
+            let result = channel_host::http_request(
+                "POST",
+                &mention_url,
+                &discord_auth_headers_json(true),
+                Some(&mention_payload),
+                None,
+            );
+            return map_discord_response(result);
+        } else {
+            return Err("Unsupported Discord response metadata".to_string());
+        };
 
-        match result {
-            Ok(http_response) => {
-                if http_response.status >= 200 && http_response.status < 300 {
-                    channel_host::log(channel_host::LogLevel::Debug, "Posted followup to Discord");
-                    Ok(())
-                } else {
-                    let body_str = String::from_utf8_lossy(&http_response.body);
-                    Err(format!(
-                        "Discord API error: {} - {}",
-                        http_response.status, body_str
-                    ))
-                }
-            }
-            Err(e) => Err(format!("HTTP request failed: {}", e)),
-        }
+        let result =
+            channel_host::http_request(method, &url, &headers.to_string(), Some(&payload_bytes), None);
+
+        map_discord_response(result)
     }
 
     fn on_status(_update: StatusUpdate) {}
@@ -320,8 +345,254 @@ impl Guest for DiscordChannel {
     }
 }
 
-/// Returns true if the message was emitted, false if permission denied.
-fn handle_slash_command(interaction: &DiscordInteraction) -> bool {
+fn map_discord_response(
+    result: Result<near::agent::channel_host::HttpResponse, String>,
+) -> Result<(), String> {
+    match result {
+        Ok(http_response) => {
+            if http_response.status >= 200 && http_response.status < 300 {
+                channel_host::log(channel_host::LogLevel::Debug, "Posted response to Discord");
+                Ok(())
+            } else {
+                let body_str = String::from_utf8_lossy(&http_response.body);
+                Err(format!(
+                    "Discord API error: {} - {}",
+                    http_response.status, body_str
+                ))
+            }
+        }
+        Err(e) => Err(format!("HTTP request failed: {}", e)),
+    }
+}
+
+fn load_runtime_config() -> DiscordRuntimeConfig {
+    channel_host::workspace_read("config.json")
+        .and_then(|raw| serde_json::from_str::<DiscordRuntimeConfig>(&raw).ok())
+        .unwrap_or(DiscordRuntimeConfig {
+            polling_enabled: false,
+            poll_interval_ms: default_poll_interval_ms(),
+            mention_channel_ids: Vec::new(),
+        })
+}
+
+fn poll_for_mentions() {
+    let config = load_runtime_config();
+    if !config.polling_enabled || config.mention_channel_ids.is_empty() {
+        return;
+    }
+
+    let bot_id = match get_or_fetch_bot_id() {
+        Some(id) => id,
+        None => {
+            channel_host::log(
+                channel_host::LogLevel::Warn,
+                "Skipping mention polling: failed to resolve bot user id",
+            );
+            return;
+        }
+    };
+
+    for channel_id in &config.mention_channel_ids {
+        poll_channel_mentions(channel_id, &bot_id);
+    }
+}
+
+fn get_or_fetch_bot_id() -> Option<String> {
+    if let Some(id) = channel_host::workspace_read("bot_user_id.txt") {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let response = channel_host::http_request(
+        "GET",
+        "https://discord.com/api/v10/users/@me",
+        &discord_auth_headers_json(false),
+        None,
+        Some(10_000),
+    )
+    .ok()?;
+
+    if !(200..300).contains(&response.status) {
+        return None;
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(&response.body).ok()?;
+    let id = value.get("id")?.as_str()?.to_string();
+    let _ = channel_host::workspace_write("bot_user_id.txt", &id);
+    Some(id)
+}
+
+fn poll_channel_mentions(channel_id: &str, bot_id: &str) {
+    let cursor_path = format!("cursor_{}.txt", channel_id);
+    let last_seen = channel_host::workspace_read(&cursor_path).map(|s| s.trim().to_string());
+
+    let url = format!(
+        "https://discord.com/api/v10/channels/{}/messages?limit=25",
+        channel_id
+    );
+
+    let response = match channel_host::http_request(
+        "GET",
+        &url,
+        &discord_auth_headers_json(false),
+        None,
+        Some(10_000),
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            channel_host::log(
+                channel_host::LogLevel::Warn,
+                &format!("Discord poll request failed for channel {}: {}", channel_id, e),
+            );
+            return;
+        }
+    };
+
+    if !(200..300).contains(&response.status) {
+        let body = String::from_utf8_lossy(&response.body);
+        channel_host::log(
+            channel_host::LogLevel::Warn,
+            &format!(
+                "Discord poll failed for channel {}: status={} body={}",
+                channel_id, response.status, body
+            ),
+        );
+        return;
+    }
+
+    let mut messages: Vec<DiscordChannelMessage> = match serde_json::from_slice(&response.body) {
+        Ok(v) => v,
+        Err(e) => {
+            channel_host::log(
+                channel_host::LogLevel::Warn,
+                &format!("Failed to parse polled Discord messages: {}", e),
+            );
+            return;
+        }
+    };
+
+    // On first run for a channel, initialize the cursor to "latest seen" and
+    // skip back-processing historical messages.
+    if last_seen.is_none() {
+        if let Some(latest) = messages.first() {
+            let _ = channel_host::workspace_write(&cursor_path, &latest.id);
+        }
+        return;
+    }
+
+    messages.reverse();
+    let mut max_seen = last_seen.clone();
+
+    for msg in messages {
+        if !is_new_message(last_seen.as_deref(), &msg.id) {
+            continue;
+        }
+
+        if is_new_message(max_seen.as_deref(), &msg.id) {
+            max_seen = Some(msg.id.clone());
+        }
+
+        if msg.webhook_id.is_some() || msg.author.bot || msg.author.id == bot_id {
+            continue;
+        }
+
+        if !message_mentions_bot(&msg, bot_id) {
+            continue;
+        }
+
+        let content = strip_bot_mention(&msg.content, bot_id);
+        let metadata = DiscordMessageMetadata {
+            channel_id: msg.channel_id.clone(),
+            interaction_id: None,
+            token: None,
+            application_id: None,
+            source_message_id: Some(msg.id.clone()),
+            thread_id: None,
+        };
+
+        let metadata_json = match serde_json::to_string(&metadata) {
+            Ok(v) => v,
+            Err(e) => {
+                channel_host::log(
+                    channel_host::LogLevel::Warn,
+                    &format!("Failed to serialize mention metadata: {}", e),
+                );
+                continue;
+            }
+        };
+
+        let user_name = msg
+            .author
+            .global_name
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&msg.author.username)
+            .clone();
+
+        channel_host::emit_message(&EmittedMessage {
+            user_id: msg.author.id.clone(),
+            user_name: Some(user_name),
+            content: if content.is_empty() {
+                "mention".to_string()
+            } else {
+                content
+            },
+            thread_id: None,
+            metadata_json,
+        });
+    }
+
+    if let Some(cursor) = max_seen {
+        let _ = channel_host::workspace_write(&cursor_path, &cursor);
+    }
+}
+
+fn is_new_message(last_seen: Option<&str>, current: &str) -> bool {
+    match last_seen {
+        None => true,
+        Some(prev) => {
+            let prev_num = prev.parse::<u64>().ok();
+            let cur_num = current.parse::<u64>().ok();
+            match (prev_num, cur_num) {
+                (Some(p), Some(c)) => c > p,
+                _ => current > prev,
+            }
+        }
+    }
+}
+
+fn message_mentions_bot(msg: &DiscordChannelMessage, bot_id: &str) -> bool {
+    msg.mentions.iter().any(|u| u.id == bot_id)
+        || msg.content.contains(&format!("<@{}>", bot_id))
+        || msg.content.contains(&format!("<@!{}>", bot_id))
+}
+
+fn strip_bot_mention(content: &str, bot_id: &str) -> String {
+    content
+        .replace(&format!("<@{}>", bot_id), "")
+        .replace(&format!("<@!{}>", bot_id), "")
+        .trim()
+        .to_string()
+}
+
+fn discord_auth_headers_json(include_content_type: bool) -> String {
+    if include_content_type {
+        serde_json::json!({
+            "Content-Type": "application/json",
+            "Authorization": "Bot {DISCORD_BOT_TOKEN}"
+        })
+        .to_string()
+    } else {
+        serde_json::json!({
+            "Authorization": "Bot {DISCORD_BOT_TOKEN}"
+        })
+        .to_string()
+    }
+}
+
+fn handle_slash_command(interaction: &DiscordInteraction) {
     let user = interaction
         .member
         .as_ref()
@@ -337,22 +608,6 @@ fn handle_slash_command(interaction: &DiscordInteraction) -> bool {
                 .clone()
         })
         .unwrap_or_default();
-
-    // DM if no guild member context (only direct user field set)
-    let is_dm = interaction.member.is_none();
-
-    // Permission check
-    if !check_sender_permission(
-        &user_id,
-        Some(&user_name),
-        is_dm,
-        Some(&PairingReplyCtx {
-            application_id: interaction.application_id.clone(),
-            token: interaction.token.clone(),
-        }),
-    ) {
-        return false;
-    }
 
     let channel_id = interaction.channel_id.clone().unwrap_or_default();
 
@@ -376,9 +631,10 @@ fn handle_slash_command(interaction: &DiscordInteraction) -> bool {
 
     let metadata = DiscordMessageMetadata {
         channel_id: channel_id.clone(),
-        interaction_id: interaction.id.clone(),
-        token: interaction.token.clone(),
-        application_id: interaction.application_id.clone(),
+        interaction_id: Some(interaction.id.clone()),
+        token: Some(interaction.token.clone()),
+        application_id: Some(interaction.application_id.clone()),
+        source_message_id: None,
         thread_id: None,
     };
 
@@ -389,13 +645,14 @@ fn handle_slash_command(interaction: &DiscordInteraction) -> bool {
                 channel_host::LogLevel::Error,
                 &format!("Failed to serialize metadata: {}", e),
             );
+            // Attempt to notify user of internal error
             let url = format!(
                 "https://discord.com/api/v10/webhooks/{}/{}",
                 interaction.application_id, interaction.token
             );
             let payload = serde_json::json!({
                 "content": "❌ Internal Error: Failed to process command metadata.",
-                "flags": 64
+                "flags": 64 // Ephemeral
             });
             let _ = channel_host::http_request(
                 "POST",
@@ -404,7 +661,7 @@ fn handle_slash_command(interaction: &DiscordInteraction) -> bool {
                 Some(&serde_json::to_vec(&payload).unwrap_or_default()),
                 None,
             );
-            return true; // Error, but not a permission denial
+            return;
         }
     };
 
@@ -415,10 +672,10 @@ fn handle_slash_command(interaction: &DiscordInteraction) -> bool {
         thread_id: None,
         metadata_json,
     });
-    true
 }
 
 fn handle_message_component(interaction: &DiscordInteraction, message: &DiscordMessage) {
+    // Check member first (for server contexts), then user (for DMs)
     let user = interaction
         .member
         .as_ref()
@@ -435,18 +692,14 @@ fn handle_message_component(interaction: &DiscordInteraction, message: &DiscordM
         })
         .unwrap_or_default();
 
-    let is_dm = interaction.member.is_none();
-    if !check_sender_permission(&user_id, Some(&user_name), is_dm, None) {
-        return;
-    }
-
     let channel_id = message.channel_id.clone();
 
     let metadata = DiscordMessageMetadata {
         channel_id: channel_id.clone(),
-        interaction_id: interaction.id.clone(),
-        token: interaction.token.clone(),
-        application_id: interaction.application_id.clone(),
+        interaction_id: Some(interaction.id.clone()),
+        token: Some(interaction.token.clone()),
+        application_id: Some(interaction.application_id.clone()),
+        source_message_id: None,
         thread_id: None,
     };
 
@@ -468,145 +721,6 @@ fn handle_message_component(interaction: &DiscordInteraction, message: &DiscordM
         thread_id: None,
         metadata_json,
     });
-}
-
-// ============================================================================
-// Permission & Pairing
-// ============================================================================
-
-/// Context needed to send a pairing reply via Discord webhook followup.
-struct PairingReplyCtx {
-    application_id: String,
-    token: String,
-}
-
-/// Check if a sender is permitted to interact with the bot.
-/// Returns true if allowed, false if denied (pairing reply sent if applicable).
-fn check_sender_permission(
-    user_id: &str,
-    username: Option<&str>,
-    is_dm: bool,
-    reply_ctx: Option<&PairingReplyCtx>,
-) -> bool {
-    // 1. Owner check (highest priority, applies to all contexts)
-    let owner_id = channel_host::workspace_read(OWNER_ID_PATH).filter(|s| !s.is_empty());
-    if let Some(ref owner) = owner_id {
-        if user_id != owner {
-            channel_host::log(
-                channel_host::LogLevel::Debug,
-                &format!(
-                    "Dropping interaction from non-owner user {} (owner: {})",
-                    user_id, owner
-                ),
-            );
-            return false;
-        }
-        return true;
-    }
-
-    // 2. DM policy (only for DMs when no owner_id)
-    if !is_dm {
-        return true; // Guild interactions bypass DM policy
-    }
-
-    let dm_policy =
-        channel_host::workspace_read(DM_POLICY_PATH).unwrap_or_else(|| "pairing".to_string());
-
-    if dm_policy == "open" {
-        return true;
-    }
-
-    // 3. Build merged allow list: config allow_from + pairing store
-    let mut allowed: Vec<String> = channel_host::workspace_read(ALLOW_FROM_PATH)
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-
-    if let Ok(store_allowed) = channel_host::pairing_read_allow_from(CHANNEL_NAME) {
-        allowed.extend(store_allowed);
-    }
-
-    // 4. Check sender against allow list
-    let is_allowed = allowed.contains(&"*".to_string())
-        || allowed.contains(&user_id.to_string())
-        || username.is_some_and(|u| allowed.contains(&u.to_string()));
-
-    if is_allowed {
-        return true;
-    }
-
-    // 5. Not allowed — handle by policy
-    if dm_policy == "pairing" {
-        let meta = serde_json::json!({
-            "user_id": user_id,
-            "username": username,
-        })
-        .to_string();
-
-        match channel_host::pairing_upsert_request(CHANNEL_NAME, user_id, &meta) {
-            Ok(result) => {
-                channel_host::log(
-                    channel_host::LogLevel::Info,
-                    &format!(
-                        "Pairing request for user {}: code {}",
-                        user_id, result.code
-                    ),
-                );
-                if result.created {
-                    if let Some(ctx) = reply_ctx {
-                        let _ = send_pairing_reply(ctx, &result.code);
-                    }
-                }
-            }
-            Err(e) => {
-                channel_host::log(
-                    channel_host::LogLevel::Error,
-                    &format!("Pairing upsert failed: {}", e),
-                );
-            }
-        }
-    }
-    false
-}
-
-/// Send a pairing code as an ephemeral Discord followup message.
-fn send_pairing_reply(ctx: &PairingReplyCtx, code: &str) -> Result<(), String> {
-    let url = format!(
-        "https://discord.com/api/v10/webhooks/{}/{}",
-        ctx.application_id, ctx.token
-    );
-
-    let payload = serde_json::json!({
-        "content": format!(
-            "To pair with this bot, run: `ironclaw pairing approve discord {}`",
-            code
-        ),
-        "flags": 64 // Ephemeral — only visible to the sender
-    });
-
-    let payload_bytes =
-        serde_json::to_vec(&payload).map_err(|e| format!("Failed to serialize: {}", e))?;
-
-    let headers = serde_json::json!({"Content-Type": "application/json"});
-
-    let result = channel_host::http_request(
-        "POST",
-        &url,
-        &headers.to_string(),
-        Some(&payload_bytes),
-        None,
-    );
-
-    match result {
-        Ok(response) if response.status >= 200 && response.status < 300 => Ok(()),
-        Ok(response) => {
-            let body_str = String::from_utf8_lossy(&response.body);
-            Err(format!(
-                "Discord API error: {} - {}",
-                response.status, body_str
-            ))
-        }
-        Err(e) => Err(format!("HTTP request failed: {}", e)),
-    }
 }
 
 fn json_response(status: u16, value: serde_json::Value) -> OutgoingHttpResponse {
@@ -673,14 +787,15 @@ mod tests {
     fn test_metadata_serialization() {
         let metadata = DiscordMessageMetadata {
             channel_id: "123".into(),
-            interaction_id: "456".into(),
-            token: "abc".into(),
-            application_id: "789".into(),
+            interaction_id: Some("456".into()),
+            token: Some("abc".into()),
+            application_id: Some("789".into()),
+            source_message_id: None,
             thread_id: None,
         };
         let json = serde_json::to_string(&metadata).unwrap();
         let parsed: DiscordMessageMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.channel_id, "123");
-        assert_eq!(parsed.interaction_id, "456");
+        assert_eq!(parsed.interaction_id.as_deref(), Some("456"));
     }
 }

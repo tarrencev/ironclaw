@@ -67,7 +67,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | WASM channels | ❌ | ✅ | - | IronClaw innovation |
 | WhatsApp | ✅ | ❌ | P1 | Baileys (Web), same-phone mode with echo detection |
 | Telegram | ✅ | ✅ | - | WASM channel(MTProto), DM pairing, caption, /start, bot_username |
-| Discord | ✅ | ❌ | P2 | discord.js, thread parent binding inheritance |
+| Discord | ✅ | 🚧 | P2 | Interactions webhook + mention polling (configured channels); no full gateway parity/thread-parent inheritance |
 | Signal | ✅ | ❌ | P2 | signal-cli |
 | Slack | ✅ | ✅ | - | WASM tool |
 | iMessage | ✅ | ❌ | P3 | BlueBubbles or Linq recommended |

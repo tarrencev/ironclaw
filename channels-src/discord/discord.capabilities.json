@@ -2,15 +2,6 @@
   "type": "channel",
   "name": "discord",
   "description": "Discord Gateway/Webhook channel for handling slash commands, buttons, and messages",
-  "setup": {
-    "required_secrets": [
-      {
-        "name": "discord_bot_token",
-        "prompt": "Enter your Discord Bot Token (from Developer Portal)",
-        "optional": false
-      }
-    ]
-  },
   "capabilities": {
     "http": {
       "allowlist": [
@@ -33,8 +24,12 @@
     },
     "channel": {
       "allowed_paths": ["/webhook/discord"],
-      "allow_polling": false,
+      "allow_polling": true,
       "callback_timeout_secs": 45,
+      "webhook": {
+        "secret_header": "X-Signature-Ed25519",
+        "secret_name": "discord_public_key"
+      },
       "workspace_prefix": "channels/discord/",
       "emit_rate_limit": {
         "messages_per_minute": 100,
@@ -44,8 +39,8 @@
   },
   "config": {
     "require_signature_verification": true,
-    "owner_id": null,
-    "dm_policy": "pairing",
-    "allow_from": []
+    "polling_enabled": false,
+    "poll_interval_ms": 30000,
+    "mention_channel_ids": []
   }
 }
