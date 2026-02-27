@@ -30,9 +30,17 @@ fn api_call(method: &str, path: &str, body: Option<&str>) -> Result<String, Stri
 
     if response.status < 200 || response.status >= 300 {
         let body_text = String::from_utf8_lossy(&response.body);
+        let hint = match response.status {
+            401 => " Hint: OAuth token is missing/expired. Re-run Google auth for this user.",
+            403 => {
+                " Hint: token may lack calendar scope or account lacks access to this calendar_id."
+            }
+            404 => " Hint: calendar_id or event_id may be incorrect.",
+            _ => "",
+        };
         return Err(format!(
-            "Google Calendar API returned status {}: {}",
-            response.status, body_text
+            "Google Calendar API returned status {}: {}{}",
+            response.status, body_text, hint
         ));
     }
 
@@ -42,6 +50,39 @@ fn api_call(method: &str, path: &str, body: Option<&str>) -> Result<String, Stri
     }
 
     String::from_utf8(response.body).map_err(|e| format!("Invalid UTF-8 in response: {}", e))
+}
+
+/// List calendars visible to the authenticated user.
+pub fn list_calendars(max_results: u32, show_hidden: bool) -> Result<ListCalendarsResult, String> {
+    let capped = max_results.clamp(1, 250);
+    let path = format!(
+        "users/me/calendarList?maxResults={}&showHidden={}",
+        capped, show_hidden
+    );
+    let response = api_call("GET", &path, None)?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&response).map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    let calendars = parsed["items"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|c| CalendarListEntry {
+                    id: c["id"].as_str().unwrap_or("").to_string(),
+                    summary: c["summary"].as_str().unwrap_or("(no title)").to_string(),
+                    description: c["description"].as_str().map(|s| s.to_string()),
+                    time_zone: c["timeZone"].as_str().map(|s| s.to_string()),
+                    access_role: c["accessRole"].as_str().map(|s| s.to_string()),
+                    primary: c["primary"].as_bool(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(ListCalendarsResult {
+        calendars,
+        next_page_token: parsed["nextPageToken"].as_str().map(|s| s.to_string()),
+    })
 }
 
 /// Parse an event from the API's JSON response.

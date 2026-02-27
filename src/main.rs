@@ -1,6 +1,6 @@
 //! IronClaw - Main entry point.
 
-use std::sync::Arc;
+use std::{io::IsTerminal, sync::Arc};
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -52,6 +52,8 @@ async fn main() -> anyhow::Result<()> {
     match &cli.command {
         Some(Command::Tool(tool_cmd)) => {
             init_cli_tracing();
+            let _ = dotenvy::dotenv();
+            ironclaw::bootstrap::load_ironclaw_env();
             return run_tool_command(tool_cmd.clone()).await;
         }
         Some(Command::Config(config_cmd)) => {
@@ -321,11 +323,14 @@ async fn main() -> anyhow::Result<()> {
     // Create CLI channel
     let repl_channel = if let Some(ref msg) = cli.message {
         Some(ReplChannel::with_message(msg.clone()))
-    } else if config.channels.cli.enabled {
+    } else if config.channels.cli.enabled && std::io::stdin().is_terminal() {
         let repl = ReplChannel::new();
         repl.suppress_banner();
         Some(repl)
     } else {
+        if config.channels.cli.enabled {
+            tracing::info!("Skipping REPL channel because stdin is not a TTY");
+        }
         None
     };
 
@@ -906,6 +911,30 @@ async fn setup_wasm_channels(
                 && let Some(owner_id) = config.channels.telegram_owner_id
             {
                 config_updates.insert("owner_id".to_string(), serde_json::json!(owner_id));
+            }
+
+            // Inject Discord mention polling options.
+            if channel_name == "discord" {
+                let polling_enabled = config.channels.discord_polling_enabled
+                    || !config.channels.discord_mention_channel_ids.is_empty();
+                config_updates.insert(
+                    "polling_enabled".to_string(),
+                    serde_json::Value::Bool(polling_enabled),
+                );
+
+                if !config.channels.discord_mention_channel_ids.is_empty() {
+                    config_updates.insert(
+                        "mention_channel_ids".to_string(),
+                        serde_json::json!(config.channels.discord_mention_channel_ids),
+                    );
+                }
+
+                if let Some(interval_ms) = config.channels.discord_poll_interval_ms {
+                    config_updates.insert(
+                        "poll_interval_ms".to_string(),
+                        serde_json::json!(interval_ms),
+                    );
+                }
             }
 
             if !config_updates.is_empty() {

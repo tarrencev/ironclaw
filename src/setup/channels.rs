@@ -888,6 +888,14 @@ pub struct WasmChannelSetupResult {
     pub channel_name: String,
 }
 
+/// Discord mention monitoring configuration gathered during setup.
+#[derive(Debug, Clone)]
+pub struct DiscordMonitoringSetupResult {
+    pub polling_enabled: bool,
+    pub poll_interval_ms: Option<u32>,
+    pub mention_channel_ids: Vec<String>,
+}
+
 /// Set up a WASM channel using its capabilities file setup schema.
 ///
 /// Reads setup requirements from the channel's capabilities file and
@@ -982,6 +990,94 @@ pub async fn setup_wasm_channel(
     Ok(WasmChannelSetupResult {
         enabled: true,
         channel_name: channel_name.to_string(),
+    })
+}
+
+/// Configure Discord @mention monitoring using polling.
+pub fn setup_discord_monitoring(
+    existing_enabled: bool,
+    existing_interval_ms: Option<u32>,
+    existing_channel_ids: &[String],
+) -> Result<DiscordMonitoringSetupResult, ChannelSetupError> {
+    print_info("Discord mention monitoring:");
+    print_info("Discord does not deliver normal channel messages to the interactions webhook.");
+    print_info("Use polling to watch selected channels for @mentions.");
+
+    if !confirm(
+        "Enable @mention monitoring via polling?",
+        existing_enabled || !existing_channel_ids.is_empty(),
+    )? {
+        return Ok(DiscordMonitoringSetupResult {
+            polling_enabled: false,
+            poll_interval_ms: existing_interval_ms,
+            mention_channel_ids: Vec::new(),
+        });
+    }
+
+    let existing_csv = if existing_channel_ids.is_empty() {
+        None
+    } else {
+        Some(existing_channel_ids.join(","))
+    };
+    if let Some(ref ids) = existing_csv {
+        print_info(&format!("Current channel IDs: {}", ids));
+    }
+
+    let ids_input = optional_input(
+        "Channel IDs to monitor (comma-separated)",
+        Some("required; right-click channel -> Copy Channel ID"),
+    )?;
+    let ids_raw = ids_input
+        .filter(|s| !s.trim().is_empty())
+        .or(existing_csv)
+        .ok_or_else(|| {
+            ChannelSetupError::Validation(
+                "At least one Discord channel ID is required when polling is enabled".to_string(),
+            )
+        })?;
+
+    let mention_channel_ids: Vec<String> = ids_raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if mention_channel_ids.is_empty() {
+        return Err(ChannelSetupError::Validation(
+            "At least one Discord channel ID is required when polling is enabled".to_string(),
+        ));
+    }
+
+    if mention_channel_ids
+        .iter()
+        .any(|id| !id.chars().all(|c| c.is_ascii_digit()))
+    {
+        return Err(ChannelSetupError::Validation(
+            "Discord channel IDs must be numeric snowflakes".to_string(),
+        ));
+    }
+
+    let default_interval = existing_interval_ms.unwrap_or(3_000).max(2_000);
+    let interval_input = optional_input(
+        &format!("Poll interval in milliseconds (default: {default_interval})"),
+        Some("minimum 2000"),
+    )?;
+    let poll_interval_ms = match interval_input {
+        Some(raw) if !raw.trim().is_empty() => {
+            let parsed = raw
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| ChannelSetupError::Validation("Invalid poll interval".to_string()))?;
+            Some(parsed.max(2_000))
+        }
+        _ => Some(default_interval),
+    };
+
+    print_success("Discord mention monitoring configured");
+    Ok(DiscordMonitoringSetupResult {
+        polling_enabled: true,
+        poll_interval_ms,
+        mention_channel_ids,
     })
 }
 

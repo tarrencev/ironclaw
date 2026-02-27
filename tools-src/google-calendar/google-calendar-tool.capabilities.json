@@ -32,7 +32,8 @@
       "client_id_env": "GOOGLE_OAUTH_CLIENT_ID",
       "client_secret_env": "GOOGLE_OAUTH_CLIENT_SECRET",
       "scopes": [
-        "https://www.googleapis.com/auth/calendar.events"
+        "https://www.googleapis.com/auth/calendar.events",
+        "https://www.googleapis.com/auth/calendar.readonly"
       ],
       "use_pkce": false,
       "extra_params": {

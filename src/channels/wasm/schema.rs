@@ -473,7 +473,7 @@ mod tests {
         let caps = file.to_capabilities();
 
         // Should be clamped to minimum
-        assert_eq!(caps.min_poll_interval_ms, 30000);
+        assert_eq!(caps.min_poll_interval_ms, 30_000);
     }
 
     #[test]

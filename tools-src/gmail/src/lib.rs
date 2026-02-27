@@ -124,8 +124,29 @@ fn execute_inner(params: &str) -> Result<String, String> {
         );
     }
 
-    let action: GmailAction =
-        serde_json::from_str(params).map_err(|e| format!("Invalid parameters: {}", e))?;
+    let raw: serde_json::Value =
+        serde_json::from_str(params).map_err(|e| format!("Invalid JSON: {e}. {}", gmail_usage_hint()))?;
+
+    let action_name = raw
+        .get("action")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            format!(
+                "Missing required field 'action'. Allowed actions: {}. {}",
+                gmail_action_list(),
+                gmail_usage_hint()
+            )
+        })?
+        .to_string();
+
+    let action: GmailAction = serde_json::from_value(raw).map_err(|e| {
+        format!(
+            "Invalid parameters for action '{}': {}. {}",
+            action_name,
+            e,
+            gmail_usage_hint_for_action(&action_name)
+        )
+    })?;
 
     crate::near::agent::host::log(
         crate::near::agent::host::LogLevel::Info,
@@ -185,6 +206,26 @@ fn execute_inner(params: &str) -> Result<String, String> {
     };
 
     Ok(result)
+}
+
+fn gmail_action_list() -> &'static str {
+    "list_messages, get_message, send_message, create_draft, reply_to_message, trash_message"
+}
+
+fn gmail_usage_hint() -> &'static str {
+    "Example: {\"action\":\"list_messages\",\"query\":\"is:unread\",\"max_results\":5}"
+}
+
+fn gmail_usage_hint_for_action(action: &str) -> &'static str {
+    match action {
+        "list_messages" => "Required: action. Optional: query, max_results, label_ids. Example: {\"action\":\"list_messages\",\"query\":\"from:alice@example.com\",\"max_results\":10}",
+        "get_message" => "Required: action, message_id. Example: {\"action\":\"get_message\",\"message_id\":\"18c7...\"}",
+        "send_message" => "Required: action, to, subject, body. Optional: cc, bcc. Example: {\"action\":\"send_message\",\"to\":\"tarrence@cartridge.gg\",\"subject\":\"Update\",\"body\":\"Done.\"}",
+        "create_draft" => "Required: action, to, subject, body. Optional: cc, bcc. Example: {\"action\":\"create_draft\",\"to\":\"tarrence@cartridge.gg\",\"subject\":\"Draft\",\"body\":\"Review this.\"}",
+        "reply_to_message" => "Required: action, message_id, body. Optional: reply_all. Example: {\"action\":\"reply_to_message\",\"message_id\":\"18c7...\",\"body\":\"Thanks\",\"reply_all\":false}",
+        "trash_message" => "Required: action, message_id. Example: {\"action\":\"trash_message\",\"message_id\":\"18c7...\"}",
+        _ => "Unknown action. Allowed actions: list_messages, get_message, send_message, create_draft, reply_to_message, trash_message.",
+    }
 }
 
 export!(GmailTool);

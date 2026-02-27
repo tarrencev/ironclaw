@@ -67,7 +67,9 @@ Step 8: Background Tasks (heartbeat)
    save_and_summarize()
 ```
 
-`--channels-only` mode runs only Step 6, skipping everything else.
+`--channels-only` mode reconnects to the existing database, then:
+- runs Step 2 (Security) only when secrets are not configured
+- always runs Step 6 (Channel Configuration)
 
 ---
 
@@ -300,6 +302,12 @@ key first, then falls back to the standard env var.
 2. Else try `SECRETS_MASTER_KEY` env var
 3. Else try `get_master_key()` from keychain (only in `channels_only` mode)
 4. Create backend-appropriate secrets store (respects selected database backend)
+
+**`--channels-only` behavior:**
+- Reconnects to existing DB/settings first.
+- Probes `init_secrets_context()`.
+- If probing fails, runs Step 2 Security before channel prompts so channel
+  secrets (e.g. Discord bot/public-key secrets) can be entered and saved.
 
 ---
 

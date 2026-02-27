@@ -27,7 +27,8 @@ use crate::llm::{SessionConfig, SessionManager};
 use crate::secrets::{SecretsCrypto, SecretsStore};
 use crate::settings::{KeySource, Settings};
 use crate::setup::channels::{
-    SecretsContext, setup_http, setup_signal, setup_telegram, setup_tunnel, setup_wasm_channel,
+    SecretsContext, setup_discord_monitoring, setup_http, setup_signal, setup_telegram,
+    setup_tunnel, setup_wasm_channel,
 };
 use crate::setup::prompts::{
     confirm, input, optional_input, print_error, print_header, print_info, print_step,
@@ -140,10 +141,22 @@ impl SetupWizard {
         print_header("IronClaw Setup Wizard");
 
         if self.config.channels_only {
-            // Channels-only mode: reconnect to existing DB and load settings
-            // before running the channel step, so secrets and save work.
+            // Channels-only mode: reconnect to existing DB and load settings.
+            // If secrets are not configured, run Security first so channel
+            // setup can prompt for and persist channel credentials.
             self.reconnect_existing_db().await?;
-            print_step(1, 1, "Channel Configuration");
+
+            let needs_security = self.init_secrets_context().await.is_err();
+            let total_steps = if needs_security { 2 } else { 1 };
+
+            if needs_security {
+                print_step(1, total_steps, "Security");
+                self.step_security().await?;
+                self.persist_after_step().await;
+            }
+
+            let channel_step = if needs_security { 2 } else { 1 };
+            print_step(channel_step, total_steps, "Channel Configuration");
             self.step_channels().await?;
         } else {
             let total_steps = 9;
@@ -1653,6 +1666,19 @@ impl SetupWizard {
 
                 if result.enabled {
                     enabled_wasm_channels.push(result.channel_name);
+                    if channel_name == "discord" {
+                        let discord_result = setup_discord_monitoring(
+                            self.settings.channels.discord_polling_enabled,
+                            self.settings.channels.discord_poll_interval_ms,
+                            &self.settings.channels.discord_mention_channel_ids,
+                        )?;
+                        self.settings.channels.discord_polling_enabled =
+                            discord_result.polling_enabled;
+                        self.settings.channels.discord_poll_interval_ms =
+                            discord_result.poll_interval_ms;
+                        self.settings.channels.discord_mention_channel_ids =
+                            discord_result.mention_channel_ids;
+                    }
                 }
             } else {
                 // No secrets context, just enable the channel
@@ -1661,6 +1687,18 @@ impl SetupWizard {
                     capitalize_first(&channel_name)
                 ));
                 enabled_wasm_channels.push(channel_name.clone());
+                if channel_name == "discord" {
+                    let discord_result = setup_discord_monitoring(
+                        self.settings.channels.discord_polling_enabled,
+                        self.settings.channels.discord_poll_interval_ms,
+                        &self.settings.channels.discord_mention_channel_ids,
+                    )?;
+                    self.settings.channels.discord_polling_enabled = discord_result.polling_enabled;
+                    self.settings.channels.discord_poll_interval_ms =
+                        discord_result.poll_interval_ms;
+                    self.settings.channels.discord_mention_channel_ids =
+                        discord_result.mention_channel_ids;
+                }
             }
         }
 

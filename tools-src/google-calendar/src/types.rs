@@ -6,6 +6,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum GoogleCalendarAction {
+    /// List calendars the authenticated user can access.
+    ListCalendars {
+        /// Maximum number of calendars to return (default: 100, max: 250).
+        #[serde(default = "default_calendar_list_max_results")]
+        max_results: u32,
+        /// Include hidden calendars if true (default: false).
+        #[serde(default)]
+        show_hidden: bool,
+    },
+
     /// List events from a calendar.
     ListEvents {
         /// Calendar ID (default: "primary").
@@ -122,6 +132,10 @@ fn default_max_results() -> u32 {
     25
 }
 
+fn default_calendar_list_max_results() -> u32 {
+    100
+}
+
 /// A Google Calendar event.
 #[derive(Debug, Serialize)]
 pub struct Event {
@@ -175,6 +189,29 @@ pub struct Organizer {
 #[derive(Debug, Serialize)]
 pub struct ListEventsResult {
     pub events: Vec<Event>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_page_token: Option<String>,
+}
+
+/// A calendar list entry available to the authenticated user.
+#[derive(Debug, Serialize)]
+pub struct CalendarListEntry {
+    pub id: String,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_zone: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary: Option<bool>,
+}
+
+/// Result from list_calendars.
+#[derive(Debug, Serialize)]
+pub struct ListCalendarsResult {
+    pub calendars: Vec<CalendarListEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_page_token: Option<String>,
 }

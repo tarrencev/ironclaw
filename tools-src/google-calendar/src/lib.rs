@@ -10,6 +10,7 @@
 //!
 //! # Supported Actions
 //!
+//! - `list_calendars`: List calendars available to the authenticated account
 //! - `list_events`: List upcoming events with optional time range and search
 //! - `get_event`: Get a specific event by ID
 //! - `create_event`: Create a new calendar event
@@ -55,8 +56,13 @@ impl exports::near::agent::tool::Guest for GoogleCalendarTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list_events", "get_event", "create_event", "update_event", "delete_event"],
+                    "enum": ["list_calendars", "list_events", "get_event", "create_event", "update_event", "delete_event"],
                     "description": "The calendar operation to perform"
+                },
+                "show_hidden": {
+                    "type": "boolean",
+                    "description": "Include hidden calendars in results. Used by: list_calendars",
+                    "default": false
                 },
                 "calendar_id": {
                     "type": "string",
@@ -143,8 +149,29 @@ fn execute_inner(params: &str) -> Result<String, String> {
         );
     }
 
-    let action: GoogleCalendarAction =
-        serde_json::from_str(params).map_err(|e| format!("Invalid parameters: {}", e))?;
+    let raw: serde_json::Value =
+        serde_json::from_str(params).map_err(|e| format!("Invalid JSON: {e}. {}", calendar_usage_hint()))?;
+
+    let action_name = raw
+        .get("action")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            format!(
+                "Missing required field 'action'. Allowed actions: {}. {}",
+                calendar_action_list(),
+                calendar_usage_hint()
+            )
+        })?
+        .to_string();
+
+    let action: GoogleCalendarAction = serde_json::from_value(raw).map_err(|e| {
+        format!(
+            "Invalid parameters for action '{}': {}. {}",
+            action_name,
+            e,
+            calendar_usage_hint_for_action(&action_name)
+        )
+    })?;
 
     crate::near::agent::host::log(
         crate::near::agent::host::LogLevel::Info,
@@ -152,6 +179,14 @@ fn execute_inner(params: &str) -> Result<String, String> {
     );
 
     let result = match action {
+        GoogleCalendarAction::ListCalendars {
+            max_results,
+            show_hidden,
+        } => {
+            let result = api::list_calendars(max_results, show_hidden)?;
+            serde_json::to_string(&result).map_err(|e| e.to_string())?
+        }
+
         GoogleCalendarAction::ListEvents {
             calendar_id,
             time_min,
@@ -243,6 +278,26 @@ fn execute_inner(params: &str) -> Result<String, String> {
     };
 
     Ok(result)
+}
+
+fn calendar_action_list() -> &'static str {
+    "list_calendars, list_events, get_event, create_event, update_event, delete_event"
+}
+
+fn calendar_usage_hint() -> &'static str {
+    "Example: {\"action\":\"list_events\",\"calendar_id\":\"primary\",\"max_results\":10}"
+}
+
+fn calendar_usage_hint_for_action(action: &str) -> &'static str {
+    match action {
+        "list_calendars" => "Required: action. Optional: max_results, show_hidden. Use this first to discover subscribed/shared calendar IDs. Example: {\"action\":\"list_calendars\",\"max_results\":100}",
+        "list_events" => "Required: action. Optional: calendar_id, time_min, time_max, max_results, query. Example: {\"action\":\"list_events\",\"calendar_id\":\"primary\",\"time_min\":\"2026-02-27T00:00:00Z\",\"time_max\":\"2026-02-28T00:00:00Z\",\"max_results\":25}",
+        "get_event" => "Required: action, event_id. Optional: calendar_id. Example: {\"action\":\"get_event\",\"calendar_id\":\"primary\",\"event_id\":\"abc123\"}",
+        "create_event" => "Required: action, summary and either (start_datetime + end_datetime) or (start_date + end_date). Optional: calendar_id, description, location, timezone, attendees. Example: {\"action\":\"create_event\",\"summary\":\"Planning\",\"start_datetime\":\"2026-02-27T10:00:00-06:00\",\"end_datetime\":\"2026-02-27T10:30:00-06:00\",\"attendees\":[\"tarrence@cartridge.gg\"]}",
+        "update_event" => "Required: action, event_id. Optional: calendar_id plus fields to change (summary, description, location, start_datetime, end_datetime, start_date, end_date, timezone, attendees).",
+        "delete_event" => "Required: action, event_id. Optional: calendar_id. Example: {\"action\":\"delete_event\",\"calendar_id\":\"primary\",\"event_id\":\"abc123\"}",
+        _ => "Unknown action. Allowed actions: list_events, get_event, create_event, update_event, delete_event.",
+    }
 }
 
 export!(GoogleCalendarTool);

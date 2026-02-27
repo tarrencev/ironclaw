@@ -106,7 +106,8 @@ impl AllowlistValidator {
         };
 
         // Check HTTPS requirement
-        if self.require_https && parsed.scheme != "https" {
+        let secure_scheme = matches!(parsed.scheme.as_str(), "https" | "wss");
+        if self.require_https && !secure_scheme {
             return AllowlistResult::Denied(DenyReason::InsecureScheme(parsed.scheme.clone()));
         }
 
@@ -174,7 +175,7 @@ struct ParsedUrl {
 fn parse_url(url: &str) -> Result<ParsedUrl, String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("URL parse failed: {e}"))?;
     let scheme = parsed.scheme().to_lowercase();
-    if scheme != "http" && scheme != "https" {
+    if scheme != "http" && scheme != "https" && scheme != "ws" && scheme != "wss" {
         return Err(format!("Unsupported scheme: {}", scheme));
     }
 
@@ -349,6 +350,13 @@ mod tests {
         let validator = validator_with_patterns().allow_http();
 
         let result = validator.validate("http://api.example.com/test", "GET");
+        assert!(result.is_allowed());
+    }
+
+    #[test]
+    fn test_allow_wss() {
+        let validator = AllowlistValidator::new(vec![EndpointPattern::host("gateway.discord.gg")]);
+        let result = validator.validate("wss://gateway.discord.gg/?v=10&encoding=json", "GET");
         assert!(result.is_allowed());
     }
 

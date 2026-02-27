@@ -379,6 +379,17 @@ impl Agent {
                             _ => {}
                         }
 
+                        if let Some(reason) =
+                            crate::agent::approval_policy::reject_tool_call_for_user(
+                                &message.user_id,
+                                &tc.name,
+                                &tc.arguments,
+                            )
+                        {
+                            preflight.push((tc, PreflightOutcome::Rejected(reason)));
+                            continue;
+                        }
+
                         // Check if tool requires approval on the final (post-hook)
                         // parameters. Skipped when auto_approve_tools is set.
                         if !self.config.auto_approve_tools
@@ -389,7 +400,12 @@ impl Agent {
                                 ApprovalRequirement::Never => false,
                                 ApprovalRequirement::UnlessAutoApproved => {
                                     let sess = session.lock().await;
-                                    !sess.is_tool_auto_approved(&tc.name)
+                                    !(sess.is_tool_auto_approved(&tc.name)
+                                        || crate::agent::approval_policy::is_tool_auto_approved_for_user(
+                                            &message.user_id,
+                                            &tc.name,
+                                            &tc.arguments,
+                                        ))
                                 }
                                 ApprovalRequirement::Always => true,
                             };

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Subcommand;
+use secrecy::ExposeSecret;
 use tokio::fs;
 
 use crate::config::Config;
@@ -571,46 +572,56 @@ async fn auth_tool(name: String, dir: Option<PathBuf>, user_id: String) -> anyho
     let crypto = SecretsCrypto::new(master_key.clone())?;
 
     let secrets_store: Arc<dyn SecretsStore + Send + Sync> = {
-        #[cfg(feature = "postgres")]
+        #[cfg(any(feature = "postgres", feature = "libsql"))]
         {
-            let store = crate::history::Store::new(&config.database).await?;
-            store.run_migrations().await?;
-            Arc::new(PostgresSecretsStore::new(store.pool(), Arc::new(crypto)))
-        }
-        #[cfg(all(feature = "libsql", not(feature = "postgres")))]
-        {
-            use crate::db::Database as _;
-            use crate::db::libsql::LibSqlBackend;
-            use secrecy::ExposeSecret as _;
+            match config.database.backend {
+                #[cfg(feature = "postgres")]
+                crate::config::DatabaseBackend::Postgres => {
+                    let store = crate::history::Store::new(&config.database).await?;
+                    store.run_migrations().await?;
+                    Arc::new(PostgresSecretsStore::new(store.pool(), Arc::new(crypto)))
+                }
+                #[cfg(feature = "libsql")]
+                crate::config::DatabaseBackend::LibSql => {
+                    use crate::db::Database as _;
+                    use crate::db::libsql::LibSqlBackend;
 
-            let default_path = crate::config::default_libsql_path();
-            let db_path = config
-                .database
-                .libsql_path
-                .as_deref()
-                .unwrap_or(&default_path);
+                    let default_path = crate::config::default_libsql_path();
+                    let db_path = config
+                        .database
+                        .libsql_path
+                        .as_deref()
+                        .unwrap_or(&default_path);
 
-            let backend = if let Some(ref url) = config.database.libsql_url {
-                let token = config.database.libsql_auth_token.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("LIBSQL_AUTH_TOKEN is required when LIBSQL_URL is set")
-                })?;
-                LibSqlBackend::new_remote_replica(db_path, url, token.expose_secret())
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{}", e))?
-            } else {
-                LibSqlBackend::new_local(db_path)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{}", e))?
-            };
-            backend
-                .run_migrations()
-                .await
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+                    let backend = if let Some(ref url) = config.database.libsql_url {
+                        let token = config.database.libsql_auth_token.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("LIBSQL_AUTH_TOKEN is required when LIBSQL_URL is set")
+                        })?;
+                        LibSqlBackend::new_remote_replica(db_path, url, token.expose_secret())
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{}", e))?
+                    } else {
+                        LibSqlBackend::new_local(db_path)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{}", e))?
+                    };
+                    backend
+                        .run_migrations()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            Arc::new(crate::secrets::LibSqlSecretsStore::new(
-                backend.shared_db(),
-                Arc::new(crypto),
-            ))
+                    Arc::new(crate::secrets::LibSqlSecretsStore::new(
+                        backend.shared_db(),
+                        Arc::new(crypto),
+                    ))
+                }
+                #[allow(unreachable_patterns)]
+                _ => {
+                    anyhow::bail!(
+                        "Configured database backend is not enabled in this build. Rebuild with matching feature flags."
+                    );
+                }
+            }
         }
         #[cfg(not(any(feature = "postgres", feature = "libsql")))]
         {
@@ -775,10 +786,21 @@ async fn auth_tool_oauth(
             )
         })?;
 
-    // Get client_secret: capabilities file > runtime env var > built-in defaults
-    let client_secret = oauth
-        .client_secret
-        .clone()
+    // Prefer encrypted secret-store client secret for Google OAuth,
+    // then fall back to capabilities/env/built-in defaults.
+    let stored_client_secret = if auth.secret_name == "google_oauth_token" {
+        store
+            .get_decrypted(user_id, "google_oauth_client_secret")
+            .await
+            .ok()
+            .map(|secret| secret.expose().to_string())
+    } else {
+        None
+    };
+
+    // Get client_secret: encrypted secret store > capabilities file > runtime env var > built-in defaults
+    let client_secret = stored_client_secret
+        .or_else(|| oauth.client_secret.clone())
         .or_else(|| {
             oauth
                 .client_secret_env

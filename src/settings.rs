@@ -252,6 +252,18 @@ pub struct ChannelSettings {
     #[serde(default)]
     pub telegram_owner_id: Option<i64>,
 
+    /// Enable Discord @mention monitoring via polling.
+    #[serde(default)]
+    pub discord_polling_enabled: bool,
+
+    /// Discord mention polling interval in milliseconds.
+    #[serde(default)]
+    pub discord_poll_interval_ms: Option<u32>,
+
+    /// Discord channel IDs to monitor for @mentions.
+    #[serde(default)]
+    pub discord_mention_channel_ids: Vec<String>,
+
     /// Enabled WASM channels by name.
     /// Channels not in this list but present in the channels directory will still load.
     /// This is primarily used by the setup wizard to track which channels were configured.

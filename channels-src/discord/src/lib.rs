@@ -113,11 +113,42 @@ struct DiscordChannelMessage {
     id: String,
     content: String,
     channel_id: String,
+    #[serde(default)]
+    guild_id: Option<String>,
     author: DiscordChannelAuthor,
     #[serde(default)]
     mentions: Vec<DiscordUser>,
     #[serde(default)]
     webhook_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordContextMessage {
+    id: String,
+    content: String,
+    author: DiscordChannelAuthor,
+    #[serde(default)]
+    webhook_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordReactionEvent {
+    user_id: String,
+    channel_id: String,
+    message_id: String,
+    #[serde(default)]
+    guild_id: Option<String>,
+    #[serde(default)]
+    member: Option<DiscordMember>,
+    emoji: DiscordEmoji,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscordEmoji {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,6 +178,8 @@ struct DiscordRuntimeConfig {
     dm_policy: String,
     #[serde(default)]
     allow_from: Vec<String>,
+    #[serde(default = "default_gateway_push_enabled")]
+    gateway_push_enabled: bool,
 }
 
 fn default_poll_interval_ms() -> u32 {
@@ -161,6 +194,10 @@ fn default_dm_policy() -> String {
     "pairing".to_string()
 }
 
+fn default_gateway_push_enabled() -> bool {
+    true
+}
+
 fn default_runtime_config() -> DiscordRuntimeConfig {
     DiscordRuntimeConfig {
         require_signature_verification: default_require_signature_verification(),
@@ -171,6 +208,7 @@ fn default_runtime_config() -> DiscordRuntimeConfig {
         owner_id: None,
         dm_policy: default_dm_policy(),
         allow_from: Vec::new(),
+        gateway_push_enabled: default_gateway_push_enabled(),
     }
 }
 
@@ -207,6 +245,36 @@ struct DiscordMessageMetadata {
 
     /// Thread ID (for forum threads)
     thread_id: Option<String>,
+}
+
+const WS_HANDLE_PATH: &str = "state/ws_handle";
+const GATEWAY_SEQ_PATH: &str = "state/gateway_seq";
+const GATEWAY_SESSION_ID_PATH: &str = "state/gateway_session_id";
+const HEARTBEAT_INTERVAL_PATH: &str = "state/heartbeat_interval_ms";
+const NEXT_HEARTBEAT_AT_PATH: &str = "state/next_heartbeat_at_ms";
+const GATEWAY_IDENTIFIED_PATH: &str = "state/gateway_identified";
+const APPROVAL_MESSAGE_IDS_PATH: &str = "state/approval_message_ids.json";
+
+#[derive(Debug, Deserialize)]
+struct DiscordGatewayPayload {
+    op: u8,
+    #[serde(default)]
+    d: serde_json::Value,
+    #[serde(default)]
+    s: Option<u64>,
+    #[serde(default)]
+    t: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GatewayHelloData {
+    heartbeat_interval: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GatewayReadyData {
+    session_id: String,
+    user: DiscordUser,
 }
 
 struct DiscordChannel;
@@ -264,6 +332,30 @@ impl Guest for DiscordChannel {
             serde_json::to_string(&config.allow_from).unwrap_or_else(|_| "[]".to_string());
         let _ = channel_host::workspace_write(ALLOW_FROM_PATH, &allow_from_json);
 
+        let poll_enabled = config.gateway_push_enabled || config.polling_enabled;
+        if config.gateway_push_enabled {
+            channel_host::log(
+                channel_host::LogLevel::Info,
+                "Discord gateway push enabled (ws)",
+            );
+        } else if config.polling_enabled {
+            channel_host::log(
+                channel_host::LogLevel::Info,
+                "Discord mention polling enabled (rest)",
+            );
+        } else {
+            channel_host::log(
+                channel_host::LogLevel::Warn,
+                "Discord channel has no inbound mode enabled (set gateway_push_enabled or polling_enabled)",
+            );
+        }
+
+        let poll_interval_ms = if config.gateway_push_enabled {
+            config.poll_interval_ms.max(30_000)
+        } else {
+            config.poll_interval_ms.max(30_000)
+        };
+
         Ok(ChannelConfig {
             display_name: "Discord".to_string(),
             http_endpoints: vec![HttpEndpointConfig {
@@ -271,9 +363,9 @@ impl Guest for DiscordChannel {
                 methods: vec!["POST".to_string()],
                 require_secret: false,
             }],
-            poll: if config.polling_enabled {
+            poll: if poll_enabled {
                 Some(PollConfig {
-                    interval_ms: config.poll_interval_ms.max(30_000),
+                    interval_ms: poll_interval_ms,
                     enabled: true,
                 })
             } else {
@@ -395,7 +487,15 @@ impl Guest for DiscordChannel {
     }
 
     fn on_poll() {
-        poll_for_mentions();
+        let config = load_runtime_config();
+        channel_host::log(channel_host::LogLevel::Info, "Discord on_poll tick");
+        if config.gateway_push_enabled {
+            channel_host::log(channel_host::LogLevel::Info, "Discord on_poll mode=gateway");
+            poll_gateway_events(&config);
+        } else {
+            channel_host::log(channel_host::LogLevel::Info, "Discord on_poll mode=mentions");
+            poll_for_mentions();
+        }
     }
 
     fn on_respond(response: AgentResponse) -> Result<(), String> {
@@ -451,6 +551,7 @@ impl Guest for DiscordChannel {
                 Some(&mention_payload),
                 None,
             );
+            maybe_seed_approval_reactions(&metadata.channel_id, &content, &result);
             return map_discord_response(result);
         } else {
             return Err("Unsupported Discord response metadata".to_string());
@@ -501,6 +602,447 @@ fn load_runtime_config() -> DiscordRuntimeConfig {
     channel_host::workspace_read("config.json")
         .and_then(|raw| serde_json::from_str::<DiscordRuntimeConfig>(&raw).ok())
         .unwrap_or_else(default_runtime_config)
+}
+
+fn poll_gateway_events(config: &DiscordRuntimeConfig) {
+    channel_host::log(
+        channel_host::LogLevel::Info,
+        "Discord gateway poll cycle start",
+    );
+    let bot_id = match get_or_fetch_bot_id() {
+        Some(id) => id,
+        None => {
+            channel_host::log(
+                channel_host::LogLevel::Warn,
+                "Skipping gateway poll: failed to resolve bot user id",
+            );
+            return;
+        }
+    };
+
+    let mut handle = read_u32(WS_HANDLE_PATH);
+    if handle.is_none() {
+        channel_host::log(channel_host::LogLevel::Info, "Discord gateway connecting socket");
+        handle = connect_gateway_socket();
+    }
+    let Some(handle) = handle else {
+        channel_host::log(channel_host::LogLevel::Warn, "Discord gateway socket unavailable");
+        return;
+    };
+    channel_host::log(
+        channel_host::LogLevel::Info,
+        &format!("Discord gateway using handle={}", handle),
+    );
+
+    if !send_heartbeat_if_due(handle) {
+        channel_host::log(
+            channel_host::LogLevel::Warn,
+            "Discord gateway heartbeat/send check failed; resetting socket",
+        );
+        reset_gateway_socket(handle);
+        return;
+    }
+
+    // Process a short burst per tick to stay under WASM callback deadlines.
+    for _ in 0..8 {
+        channel_host::log(
+            channel_host::LogLevel::Info,
+            &format!("Discord gateway waiting recv handle={}", handle),
+        );
+        match channel_host::ws_recv(handle, Some(200)) {
+            Ok(Some(text)) => {
+                channel_host::log(
+                    channel_host::LogLevel::Info,
+                    &format!("Discord gateway recv text bytes={}", text.len()),
+                );
+                if !process_gateway_payload(config, &bot_id, handle, &text) {
+                    reset_gateway_socket(handle);
+                    return;
+                }
+            }
+            Ok(None) => {
+                channel_host::log(channel_host::LogLevel::Info, "Discord gateway recv timeout");
+                break;
+            }
+            Err(e) => {
+                channel_host::log(
+                    channel_host::LogLevel::Warn,
+                    &format!("Discord gateway receive failed: {}", e),
+                );
+                reset_gateway_socket(handle);
+                return;
+            }
+        }
+    }
+}
+
+fn connect_gateway_socket() -> Option<u32> {
+    let gateway_url = "wss://gateway.discord.gg/?v=10&encoding=json";
+    let headers = serde_json::json!({
+        "User-Agent": "ironclaw-discord-channel/0.1"
+    });
+    match channel_host::ws_connect(gateway_url, &headers.to_string()) {
+        Ok(handle) => {
+            let _ = channel_host::workspace_write(WS_HANDLE_PATH, &handle.to_string());
+            let _ = channel_host::workspace_write(GATEWAY_IDENTIFIED_PATH, "false");
+            Some(handle)
+        }
+        Err(e) => {
+            channel_host::log(
+                channel_host::LogLevel::Warn,
+                &format!("Discord gateway connect failed: {}", e),
+            );
+            None
+        }
+    }
+}
+
+fn process_gateway_payload(
+    config: &DiscordRuntimeConfig,
+    bot_id: &str,
+    ws_handle: u32,
+    payload_text: &str,
+) -> bool {
+    channel_host::log(
+        channel_host::LogLevel::Info,
+        &format!("Discord gateway process payload len={}", payload_text.len()),
+    );
+    let payload: DiscordGatewayPayload = match serde_json::from_str(payload_text) {
+        Ok(v) => v,
+        Err(e) => {
+            channel_host::log(
+                channel_host::LogLevel::Debug,
+                &format!("Ignoring non-gateway payload: {}", e),
+            );
+            return true;
+        }
+    };
+
+    if let Some(seq) = payload.s {
+        let _ = channel_host::workspace_write(GATEWAY_SEQ_PATH, &seq.to_string());
+    }
+
+    match payload.op {
+        10 => {
+            // HELLO
+            let hello: GatewayHelloData = match serde_json::from_value(payload.d) {
+                Ok(v) => v,
+                Err(e) => {
+                    channel_host::log(
+                        channel_host::LogLevel::Warn,
+                        &format!("Discord HELLO parse failed: {}", e),
+                    );
+                    return false;
+                }
+            };
+            let _ = channel_host::workspace_write(
+                HEARTBEAT_INTERVAL_PATH,
+                &hello.heartbeat_interval.to_string(),
+            );
+            let _ = channel_host::workspace_write(
+                NEXT_HEARTBEAT_AT_PATH,
+                &channel_host::now_millis()
+                    .saturating_add(hello.heartbeat_interval)
+                    .to_string(),
+            );
+            identify_or_resume(ws_handle)
+        }
+        11 => true, // heartbeat ACK
+        0 => {
+            if let Some(event_name) = payload.t.as_deref() {
+                match event_name {
+                    "READY" => handle_gateway_ready(payload.d),
+                    "MESSAGE_CREATE" => handle_gateway_message(config, bot_id, payload.d),
+                    "MESSAGE_REACTION_ADD" => handle_gateway_reaction(config, bot_id, payload.d),
+                    _ => true,
+                }
+            } else {
+                true
+            }
+        }
+        7 | 9 => false, // reconnect / invalid session
+        _ => true,
+    }
+}
+
+fn identify_or_resume(ws_handle: u32) -> bool {
+    channel_host::log(
+        channel_host::LogLevel::Info,
+        "Discord gateway identify_or_resume start",
+    );
+    if let Some(session_id) = channel_host::workspace_read(GATEWAY_SESSION_ID_PATH) {
+        if !session_id.is_empty() {
+            if let Some(seq) = read_u64(GATEWAY_SEQ_PATH) {
+                let payload = serde_json::json!({
+                    "op": 6,
+                    "d": {
+                        "token": "{DISCORD_BOT_TOKEN}",
+                        "session_id": session_id,
+                        "seq": seq
+                    }
+                });
+                if channel_host::ws_send(ws_handle, &payload.to_string()).is_ok() {
+                    channel_host::log(channel_host::LogLevel::Info, "Discord gateway resume sent");
+                    return true;
+                }
+            }
+        }
+    }
+
+    let payload = serde_json::json!({
+        "op": 2,
+        "d": {
+            "token": "{DISCORD_BOT_TOKEN}",
+            "intents": 46593u32,
+            "properties": {
+                "$os": "linux",
+                "$browser": "ironclaw",
+                "$device": "ironclaw"
+            }
+        }
+    });
+    if let Err(e) = channel_host::ws_send(ws_handle, &payload.to_string()) {
+        channel_host::log(
+            channel_host::LogLevel::Warn,
+            &format!("Discord gateway identify failed: {}", e),
+        );
+        return false;
+    }
+    channel_host::log(channel_host::LogLevel::Info, "Discord gateway identify sent");
+    let _ = channel_host::workspace_write(GATEWAY_IDENTIFIED_PATH, "true");
+    true
+}
+
+fn send_heartbeat_if_due(ws_handle: u32) -> bool {
+    // Wait for HELLO before sending heartbeats.
+    if read_u64(HEARTBEAT_INTERVAL_PATH).is_none() {
+        return true;
+    }
+
+    let next_heartbeat = read_u64(NEXT_HEARTBEAT_AT_PATH).unwrap_or(0);
+    let now = channel_host::now_millis();
+    if next_heartbeat > now {
+        return true;
+    }
+
+    let seq = read_u64(GATEWAY_SEQ_PATH);
+    let heartbeat_payload = serde_json::json!({
+        "op": 1,
+        "d": seq
+    });
+    if let Err(e) = channel_host::ws_send(ws_handle, &heartbeat_payload.to_string()) {
+        channel_host::log(
+            channel_host::LogLevel::Warn,
+            &format!("Discord gateway heartbeat failed: {}", e),
+        );
+        return false;
+    }
+
+    let heartbeat_interval = read_u64(HEARTBEAT_INTERVAL_PATH).unwrap_or(41_250);
+    let _ = channel_host::workspace_write(
+        NEXT_HEARTBEAT_AT_PATH,
+        &now.saturating_add(heartbeat_interval).to_string(),
+    );
+    true
+}
+
+fn handle_gateway_ready(value: serde_json::Value) -> bool {
+    let ready: GatewayReadyData = match serde_json::from_value(value) {
+        Ok(v) => v,
+        Err(e) => {
+            channel_host::log(
+                channel_host::LogLevel::Warn,
+                &format!("Discord READY parse failed: {}", e),
+            );
+            return false;
+        }
+    };
+
+    let _ = channel_host::workspace_write("bot_user_id.txt", &ready.user.id);
+    let _ = channel_host::workspace_write(GATEWAY_SESSION_ID_PATH, &ready.session_id);
+    true
+}
+
+fn handle_gateway_message(config: &DiscordRuntimeConfig, bot_id: &str, value: serde_json::Value) -> bool {
+    let msg: DiscordChannelMessage = match serde_json::from_value(value) {
+        Ok(v) => v,
+        Err(e) => {
+            channel_host::log(
+                channel_host::LogLevel::Warn,
+                &format!("Discord MESSAGE_CREATE parse failed: {}", e),
+            );
+            return true;
+        }
+    };
+
+    if msg.webhook_id.is_some() || msg.author.bot || msg.author.id == bot_id {
+        return true;
+    }
+
+    let is_dm = msg.guild_id.is_none();
+    let is_control_reply = is_control_or_approval_reply(&msg.content);
+    if !is_dm {
+        if !config.mention_channel_ids.is_empty()
+            && !config.mention_channel_ids.iter().any(|id| id == &msg.channel_id)
+        {
+            return true;
+        }
+
+        if !is_control_reply && !message_mentions_bot(&msg, bot_id) {
+            return true;
+        }
+    }
+
+    let user_name = msg
+        .author
+        .global_name
+        .as_ref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&msg.author.username)
+        .clone();
+    if !check_sender_permission(&msg.author.id, Some(&user_name), is_dm, None) {
+        return true;
+    }
+
+    // Signal liveness immediately so Discord users see processing start right away.
+    send_typing_indicator(&msg.channel_id);
+
+    let mut content = if is_dm || is_control_reply {
+        msg.content.clone()
+    } else {
+        strip_bot_mention(&msg.content, bot_id)
+    };
+    content = content.trim().to_string();
+    if !is_control_reply {
+        content = with_conversation_context(&msg.channel_id, &msg.id, &msg.author.id, &content);
+    }
+
+    let metadata = DiscordMessageMetadata {
+        channel_id: msg.channel_id.clone(),
+        interaction_id: None,
+        token: None,
+        application_id: None,
+        source_message_id: Some(msg.id.clone()),
+        thread_id: None,
+    };
+    let metadata_json = match serde_json::to_string(&metadata) {
+        Ok(v) => v,
+        Err(e) => {
+            channel_host::log(
+                channel_host::LogLevel::Warn,
+                &format!("Failed to serialize gateway metadata: {}", e),
+            );
+            return true;
+        }
+    };
+
+    channel_host::emit_message(&EmittedMessage {
+        user_id: msg.author.id,
+        user_name: Some(user_name),
+        content: if content.trim().is_empty() {
+            "message".to_string()
+        } else {
+            content
+        },
+        thread_id: None,
+        metadata_json,
+    });
+    true
+}
+
+fn handle_gateway_reaction(
+    config: &DiscordRuntimeConfig,
+    bot_id: &str,
+    value: serde_json::Value,
+) -> bool {
+    let reaction: DiscordReactionEvent = match serde_json::from_value(value) {
+        Ok(v) => v,
+        Err(e) => {
+            channel_host::log(
+                channel_host::LogLevel::Warn,
+                &format!("Discord MESSAGE_REACTION_ADD parse failed: {}", e),
+            );
+            return true;
+        }
+    };
+
+    if reaction.user_id == bot_id {
+        return true;
+    }
+    if !is_approval_message_id(&reaction.message_id) {
+        return true;
+    }
+    let Some(action) = map_reaction_to_approval_action(&reaction.emoji) else {
+        return true;
+    };
+
+    let is_dm = reaction.guild_id.is_none();
+    if !is_dm
+        && !config.mention_channel_ids.is_empty()
+        && !config
+            .mention_channel_ids
+            .iter()
+            .any(|id| id == &reaction.channel_id)
+    {
+        return true;
+    }
+
+    let user_name = reaction.member.as_ref().map(|m| {
+        m.user
+            .global_name
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&m.user.username)
+            .clone()
+    });
+    if !check_sender_permission(&reaction.user_id, user_name.as_deref(), is_dm, None) {
+        return true;
+    }
+
+    forget_approval_message_id(&reaction.message_id);
+    let metadata = DiscordMessageMetadata {
+        channel_id: reaction.channel_id,
+        interaction_id: None,
+        token: None,
+        application_id: None,
+        source_message_id: Some(reaction.message_id),
+        thread_id: None,
+    };
+    let metadata_json = match serde_json::to_string(&metadata) {
+        Ok(v) => v,
+        Err(e) => {
+            channel_host::log(
+                channel_host::LogLevel::Warn,
+                &format!("Failed to serialize reaction metadata: {}", e),
+            );
+            return true;
+        }
+    };
+
+    channel_host::emit_message(&EmittedMessage {
+        user_id: reaction.user_id,
+        user_name,
+        content: action.to_string(),
+        thread_id: None,
+        metadata_json,
+    });
+    true
+}
+
+fn reset_gateway_socket(handle: u32) {
+    let _ = channel_host::ws_close(handle);
+    let _ = channel_host::workspace_write(WS_HANDLE_PATH, "");
+    let _ = channel_host::workspace_write(GATEWAY_IDENTIFIED_PATH, "false");
+}
+
+fn read_u64(path: &str) -> Option<u64> {
+    channel_host::workspace_read(path)
+        .and_then(|v| v.trim().parse::<u64>().ok())
+}
+
+fn read_u32(path: &str) -> Option<u32> {
+    channel_host::workspace_read(path)
+        .and_then(|v| v.trim().parse::<u32>().ok())
 }
 
 fn poll_for_mentions() {
@@ -588,7 +1130,8 @@ fn poll_channel_mentions(channel_id: &str, bot_id: &str) {
             continue;
         }
 
-        if !message_mentions_bot(&msg, bot_id) {
+        let is_control_reply = is_control_or_approval_reply(&msg.content);
+        if !is_control_reply && !message_mentions_bot(&msg, bot_id) {
             continue;
         }
 
@@ -607,7 +1150,17 @@ fn poll_channel_mentions(channel_id: &str, bot_id: &str) {
             continue;
         }
 
-        let content = strip_bot_mention(&msg.content, bot_id);
+        // Signal liveness immediately so Discord users see processing start right away.
+        send_typing_indicator(channel_id);
+
+        let mut content = if is_control_reply {
+            msg.content.trim().to_string()
+        } else {
+            strip_bot_mention(&msg.content, bot_id)
+        };
+        if !is_control_reply {
+            content = with_conversation_context(channel_id, &msg.id, &msg.author.id, &content);
+        }
         let metadata = DiscordMessageMetadata {
             channel_id: msg.channel_id.clone(),
             interaction_id: None,
@@ -834,12 +1387,254 @@ fn message_mentions_bot(msg: &DiscordChannelMessage, bot_id: &str) -> bool {
         || msg.content.contains(&format!("<@!{}>", bot_id))
 }
 
+fn map_reaction_to_approval_action(emoji: &DiscordEmoji) -> Option<&'static str> {
+    let name = emoji.name.as_deref()?;
+    match name {
+        "✅" => Some("yes"),
+        "❌" => Some("no"),
+        "🔁" | "♾️" | "♾" => Some("always"),
+        _ => None,
+    }
+}
+
 fn strip_bot_mention(content: &str, bot_id: &str) -> String {
     content
         .replace(&format!("<@{}>", bot_id), "")
         .replace(&format!("<@!{}>", bot_id), "")
         .trim()
         .to_string()
+}
+
+fn is_control_or_approval_reply(content: &str) -> bool {
+    let normalized = content
+        .trim()
+        .trim_end_matches(|c: char| matches!(c, '.' | '!' | '?'))
+        .to_ascii_lowercase();
+
+    matches!(
+        normalized.as_str(),
+        "yes"
+            | "y"
+            | "approve"
+            | "ok"
+            | "always"
+            | "a"
+            | "yes always"
+            | "approve always"
+            | "no"
+            | "n"
+            | "deny"
+            | "reject"
+            | "/approve"
+            | "/yes"
+            | "/y"
+            | "/always"
+            | "/a"
+            | "/deny"
+            | "/no"
+            | "/n"
+            | "/interrupt"
+            | "/stop"
+    )
+}
+
+fn with_conversation_context(
+    channel_id: &str,
+    trigger_message_id: &str,
+    trigger_user_id: &str,
+    user_request: &str,
+) -> String {
+    let Some(context) = fetch_recent_context(channel_id, trigger_message_id) else {
+        return user_request.to_string();
+    };
+
+    if context.is_empty() {
+        return user_request.to_string();
+    }
+
+    let mut lines = Vec::new();
+    for msg in context {
+        let mut text = msg.content.trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        if text.len() > 220 {
+            let cutoff = text
+                .char_indices()
+                .take_while(|(idx, _)| *idx < 220)
+                .last()
+                .map(|(idx, ch)| idx + ch.len_utf8())
+                .unwrap_or(220);
+            text = format!("{}...", &text[..cutoff]);
+        }
+
+        let name = msg
+            .author
+            .global_name
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&msg.author.username)
+            .to_string();
+        let marker = if msg.id == trigger_message_id {
+            " (trigger)"
+        } else if msg.author.id == trigger_user_id {
+            " (same_user)"
+        } else {
+            ""
+        };
+        lines.push(format!("{}{}: {}", name, marker, text));
+    }
+
+    if lines.is_empty() {
+        return user_request.to_string();
+    }
+
+    format!(
+        "[Discord conversation context]\n{}\n[/Discord conversation context]\n\n{}",
+        lines.join("\n"),
+        user_request
+    )
+}
+
+fn fetch_recent_context(channel_id: &str, trigger_message_id: &str) -> Option<Vec<DiscordContextMessage>> {
+    let url = format!(
+        "https://discord.com/api/v10/channels/{}/messages?limit=12&around={}",
+        channel_id, trigger_message_id
+    );
+    let response = channel_host::http_request(
+        "GET",
+        &url,
+        &discord_auth_headers_json(false),
+        None,
+        Some(10_000),
+    )
+    .ok()?;
+    if !(200..300).contains(&response.status) {
+        return None;
+    }
+
+    let mut messages: Vec<DiscordContextMessage> = serde_json::from_slice(&response.body).ok()?;
+    messages.sort_by(|a, b| compare_message_ids(&a.id, &b.id));
+    Some(
+        messages
+            .into_iter()
+            .filter(|m| m.webhook_id.is_none())
+            .collect(),
+    )
+}
+
+fn send_typing_indicator(channel_id: &str) {
+    let url = format!("https://discord.com/api/v10/channels/{}/typing", channel_id);
+    match channel_host::http_request(
+        "POST",
+        &url,
+        &discord_auth_headers_json(false),
+        None,
+        Some(5_000),
+    ) {
+        Ok(resp) if (200..300).contains(&resp.status) => {}
+        Ok(resp) => {
+            let body = String::from_utf8_lossy(&resp.body);
+            channel_host::log(
+                channel_host::LogLevel::Debug,
+                &format!(
+                    "Discord typing indicator failed: channel={} status={} body={}",
+                    channel_id, resp.status, body
+                ),
+            );
+        }
+        Err(e) => {
+            channel_host::log(
+                channel_host::LogLevel::Debug,
+                &format!(
+                    "Discord typing indicator request error: channel={} error={}",
+                    channel_id, e
+                ),
+            );
+        }
+    }
+}
+
+fn maybe_seed_approval_reactions(
+    channel_id: &str,
+    content: &str,
+    result: &Result<near::agent::channel_host::HttpResponse, String>,
+) {
+    if !content.trim_start().starts_with("Approval needed:") {
+        return;
+    }
+    let Ok(response) = result else {
+        return;
+    };
+    if !(200..300).contains(&response.status) {
+        return;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&response.body) else {
+        return;
+    };
+    let Some(message_id) = value.get("id").and_then(|v| v.as_str()) else {
+        return;
+    };
+
+    remember_approval_message_id(message_id);
+    for emoji in [
+        "%E2%9C%85", // ✅ approve once
+        "%F0%9F%94%81", // 🔁 always approve
+        "%E2%9D%8C", // ❌ deny
+    ] {
+        let url = format!(
+            "https://discord.com/api/v10/channels/{}/messages/{}/reactions/{}/@me",
+            channel_id, message_id, emoji
+        );
+        let _ = channel_host::http_request(
+            "PUT",
+            &url,
+            &discord_auth_headers_json(false),
+            None,
+            Some(5_000),
+        );
+    }
+}
+
+fn load_approval_message_ids() -> Vec<String> {
+    channel_host::workspace_read(APPROVAL_MESSAGE_IDS_PATH)
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_approval_message_ids(ids: &[String]) -> Result<(), String> {
+    let raw = serde_json::to_string(ids)
+        .map_err(|e| format!("Failed to serialize approval ids: {}", e))?;
+    channel_host::workspace_write(APPROVAL_MESSAGE_IDS_PATH, &raw)
+}
+
+fn remember_approval_message_id(message_id: &str) {
+    const MAX_IDS: usize = 200;
+    let mut ids = load_approval_message_ids();
+    if ids.iter().any(|id| id == message_id) {
+        return;
+    }
+    ids.push(message_id.to_string());
+    if ids.len() > MAX_IDS {
+        let drop_count = ids.len() - MAX_IDS;
+        ids.drain(0..drop_count);
+    }
+    let _ = save_approval_message_ids(&ids);
+}
+
+fn forget_approval_message_id(message_id: &str) {
+    let mut ids = load_approval_message_ids();
+    let before = ids.len();
+    ids.retain(|id| id != message_id);
+    if ids.len() != before {
+        let _ = save_approval_message_ids(&ids);
+    }
+}
+
+fn is_approval_message_id(message_id: &str) -> bool {
+    load_approval_message_ids()
+        .iter()
+        .any(|id| id == message_id)
 }
 
 fn discord_auth_headers_json(include_content_type: bool) -> String {
@@ -1291,6 +2086,7 @@ mod tests {
             id: "1".to_string(),
             content: "hello <@123>".to_string(),
             channel_id: "10".to_string(),
+            guild_id: None,
             author: DiscordChannelAuthor {
                 id: "u1".to_string(),
                 username: "alice".to_string(),
@@ -1305,11 +2101,48 @@ mod tests {
     }
 
     #[test]
+    fn test_is_control_or_approval_reply() {
+        assert!(is_control_or_approval_reply("yes"));
+        assert!(is_control_or_approval_reply("yes."));
+        assert!(is_control_or_approval_reply("always"));
+        assert!(is_control_or_approval_reply("/approve"));
+        assert!(is_control_or_approval_reply("/interrupt"));
+        assert!(is_control_or_approval_reply("deny"));
+        assert!(!is_control_or_approval_reply("yes please"));
+        assert!(!is_control_or_approval_reply("what's next?"));
+    }
+
+    #[test]
+    fn test_map_reaction_to_approval_action() {
+        let yes = DiscordEmoji {
+            name: Some("✅".to_string()),
+            id: None,
+        };
+        let always = DiscordEmoji {
+            name: Some("🔁".to_string()),
+            id: None,
+        };
+        let no = DiscordEmoji {
+            name: Some("❌".to_string()),
+            id: None,
+        };
+        let other = DiscordEmoji {
+            name: Some("👍".to_string()),
+            id: None,
+        };
+        assert_eq!(map_reaction_to_approval_action(&yes), Some("yes"));
+        assert_eq!(map_reaction_to_approval_action(&always), Some("always"));
+        assert_eq!(map_reaction_to_approval_action(&no), Some("no"));
+        assert_eq!(map_reaction_to_approval_action(&other), None);
+    }
+
+    #[test]
     fn test_message_mentions_bot_via_mentions_array() {
         let msg = DiscordChannelMessage {
             id: "2".to_string(),
             content: "hello".to_string(),
             channel_id: "10".to_string(),
+            guild_id: None,
             author: DiscordChannelAuthor {
                 id: "u1".to_string(),
                 username: "alice".to_string(),

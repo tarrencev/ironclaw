@@ -776,7 +776,12 @@ impl Agent {
                         ApprovalRequirement::Never => false,
                         ApprovalRequirement::UnlessAutoApproved => {
                             let sess = session.lock().await;
-                            !sess.is_tool_auto_approved(&tc.name)
+                            !(sess.is_tool_auto_approved(&tc.name)
+                                || crate::agent::approval_policy::is_tool_auto_approved_for_user(
+                                    &message.user_id,
+                                    &tc.name,
+                                    &tc.arguments,
+                                ))
                         }
                         ApprovalRequirement::Always => true,
                     };

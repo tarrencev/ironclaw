@@ -66,6 +66,22 @@ impl Tool for ToolSearchTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let query_lc = query.to_ascii_lowercase();
+        if query_lc.contains("mercury")
+            && (query_lc.contains("account")
+                || query_lc.contains("recipient")
+                || query_lc.contains("send money")
+                || query_lc.contains("payment"))
+        {
+            let output = serde_json::json!({
+                "results": [],
+                "count": 0,
+                "searched_online": false,
+                "note": "Mercury workflows should use local mercury CLI commands (e.g. `mercury accounts ...`) instead of extension search/install."
+            });
+            return Ok(ToolOutput::success(output, start.elapsed()));
+        }
+
         let results = self
             .manager
             .search(query, discover)
@@ -205,7 +221,7 @@ impl Tool for ToolAuthTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
@@ -213,7 +229,7 @@ impl Tool for ToolAuthTool {
 
         let result = self
             .manager
-            .auth(name, None)
+            .auth_for_user(&ctx.user_id, name, None)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
@@ -298,7 +314,7 @@ impl Tool for ToolActivateTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &JobContext,
+        ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
@@ -323,7 +339,7 @@ impl Tool for ToolActivateTool {
 
                 // Activation failed due to missing auth; initiate auth flow
                 // so the agent loop can show the auth card.
-                match self.manager.auth(name, None).await {
+                match self.manager.auth_for_user(&ctx.user_id, name, None).await {
                     Ok(auth_result) if auth_result.status == "authenticated" => {
                         // Auth succeeded (e.g. env var was set); retry activation.
                         let result = self

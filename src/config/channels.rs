@@ -19,6 +19,12 @@ pub struct ChannelsConfig {
     pub wasm_channels_enabled: bool,
     /// Telegram owner user ID. When set, the bot only responds to this user.
     pub telegram_owner_id: Option<i64>,
+    /// Enable Discord @mention monitoring via channel polling.
+    pub discord_polling_enabled: bool,
+    /// Poll interval for Discord mention monitoring.
+    pub discord_poll_interval_ms: Option<u32>,
+    /// Discord channel IDs to monitor for @mentions.
+    pub discord_mention_channel_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +193,27 @@ impl ChannelsConfig {
                     message: format!("must be an integer: {e}"),
                 })?
                 .or(settings.channels.telegram_owner_id),
+            discord_polling_enabled: parse_bool_env(
+                "DISCORD_POLLING_ENABLED",
+                settings.channels.discord_polling_enabled,
+            )?,
+            discord_poll_interval_ms: optional_env("DISCORD_POLL_INTERVAL_MS")?
+                .map(|s| {
+                    s.parse::<u32>().map_err(|e| ConfigError::InvalidValue {
+                        key: "DISCORD_POLL_INTERVAL_MS".to_string(),
+                        message: format!("must be an integer: {e}"),
+                    })
+                })
+                .transpose()?
+                .or(settings.channels.discord_poll_interval_ms),
+            discord_mention_channel_ids: optional_env("DISCORD_MENTION_CHANNEL_IDS")?
+                .map(|s| {
+                    s.split(',')
+                        .map(|v| v.trim().to_string())
+                        .filter(|v| !v.is_empty())
+                        .collect()
+                })
+                .unwrap_or_else(|| settings.channels.discord_mention_channel_ids.clone()),
         })
     }
 }

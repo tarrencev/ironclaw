@@ -231,6 +231,16 @@ impl ExtensionManager {
         name: &str,
         token: Option<&str>,
     ) -> Result<AuthResult, ExtensionError> {
+        self.auth_for_user(&self.user_id, name, token).await
+    }
+
+    /// Authenticate an installed extension for a specific user scope.
+    pub async fn auth_for_user(
+        &self,
+        user_id: &str,
+        name: &str,
+        token: Option<&str>,
+    ) -> Result<AuthResult, ExtensionError> {
         // Clean up expired pending auths
         self.cleanup_expired_auths().await;
 
@@ -239,8 +249,8 @@ impl ExtensionManager {
 
         match kind {
             ExtensionKind::McpServer => self.auth_mcp(name, token).await,
-            ExtensionKind::WasmTool => self.auth_wasm_tool(name, token).await,
-            ExtensionKind::WasmChannel => self.auth_wasm_channel(name, token).await,
+            ExtensionKind::WasmTool => self.auth_wasm_tool(user_id, name, token).await,
+            ExtensionKind::WasmChannel => self.auth_wasm_channel(user_id, name, token).await,
         }
     }
 
@@ -1237,6 +1247,7 @@ impl ExtensionManager {
 
     async fn auth_wasm_tool(
         &self,
+        user_id: &str,
         name: &str,
         token: Option<&str>,
     ) -> Result<AuthResult, ExtensionError> {
@@ -1290,7 +1301,7 @@ impl ExtensionManager {
             let params =
                 CreateSecretParams::new(&auth.secret_name, &value).with_provider(name.to_string());
             self.secrets
-                .create(&self.user_id, params)
+                .create(user_id, params)
                 .await
                 .map_err(|e| ExtensionError::AuthFailed(e.to_string()))?;
 
@@ -1309,7 +1320,7 @@ impl ExtensionManager {
         // Check if already authenticated
         if self
             .secrets
-            .exists(&self.user_id, &auth.secret_name)
+            .exists(user_id, &auth.secret_name)
             .await
             .unwrap_or(false)
         {
@@ -1330,7 +1341,7 @@ impl ExtensionManager {
             let params = CreateSecretParams::new(&auth.secret_name, token_value)
                 .with_provider(name.to_string());
             self.secrets
-                .create(&self.user_id, params)
+                .create(user_id, params)
                 .await
                 .map_err(|e| ExtensionError::AuthFailed(e.to_string()))?;
 
@@ -1404,6 +1415,7 @@ impl ExtensionManager {
 
     async fn auth_wasm_channel(
         &self,
+        user_id: &str,
         name: &str,
         token: Option<&str>,
     ) -> Result<AuthResult, ExtensionError> {
@@ -1454,7 +1466,7 @@ impl ExtensionManager {
             }
             if !self
                 .secrets
-                .exists(&self.user_id, &secret.name)
+                .exists(user_id, &secret.name)
                 .await
                 .unwrap_or(false)
             {
@@ -1481,7 +1493,7 @@ impl ExtensionManager {
             let params =
                 CreateSecretParams::new(&secret.name, token_value).with_provider(name.to_string());
             self.secrets
-                .create(&self.user_id, params)
+                .create(user_id, params)
                 .await
                 .map_err(|e| ExtensionError::AuthFailed(e.to_string()))?;
 

@@ -29,12 +29,16 @@
 //! ```
 
 use std::collections::HashMap;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::sync::{RwLock, mpsc, oneshot};
+use futures::{SinkExt, StreamExt};
+use tokio::sync::{Notify, RwLock, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 use uuid::Uuid;
 use wasmtime::Store;
 use wasmtime::component::Linker;
@@ -78,18 +82,173 @@ struct ChannelStoreData {
     credentials: HashMap<String, String>,
     /// Pairing store for DM pairing (guest access control).
     pairing_store: Arc<PairingStore>,
-    /// Dedicated tokio runtime for HTTP requests, lazily initialized.
-    /// Reused across multiple `http_request` calls within one execution.
-    http_runtime: Option<tokio::runtime::Runtime>,
+    /// Shared Tokio handle used for websocket operations.
+    tokio_handle: tokio::runtime::Handle,
+    /// Shared WebSocket connection manager across callbacks for this channel.
+    ws_manager: Arc<tokio::sync::Mutex<WsConnectionManager>>,
+}
+
+#[derive(Debug)]
+struct WsConnection {
+    write_tx: tokio::sync::mpsc::UnboundedSender<WsMessage>,
+    incoming_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    read_task: tokio::task::JoinHandle<()>,
+    write_task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct WsConnectionManager {
+    next_handle: u32,
+    connections: HashMap<u32, WsConnection>,
+    wake_notify: Arc<Notify>,
+}
+
+impl WsConnectionManager {
+    fn new(wake_notify: Arc<Notify>) -> Self {
+        Self {
+            next_handle: 1,
+            connections: HashMap::new(),
+            wake_notify,
+        }
+    }
+
+    async fn connect(
+        &mut self,
+        url: &str,
+        _headers: &HashMap<String, String>,
+    ) -> Result<u32, String> {
+        let (stream, _response) = connect_async(url)
+            .await
+            .map_err(|e| format!("WebSocket connect failed: {e}"))?;
+
+        let (mut write_half, mut read_half) = stream.split();
+        let (write_tx, mut write_rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let wake_notify = Arc::clone(&self.wake_notify);
+
+        let write_tx_for_read = write_tx.clone();
+        let read_task = tokio::spawn(async move {
+            while let Some(frame) = read_half.next().await {
+                match frame {
+                    Ok(WsMessage::Text(text)) => {
+                        let _ = incoming_tx.send(text.to_string());
+                        wake_notify.notify_one();
+                    }
+                    Ok(WsMessage::Ping(payload)) => {
+                        let _ = write_tx_for_read.send(WsMessage::Pong(payload));
+                    }
+                    Ok(WsMessage::Pong(_)) => {}
+                    Ok(WsMessage::Binary(_)) => {}
+                    Ok(WsMessage::Frame(_)) => {}
+                    Ok(WsMessage::Close(_)) => break,
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let write_task = tokio::spawn(async move {
+            while let Some(msg) = write_rx.recv().await {
+                if write_half.send(msg).await.is_err() {
+                    break;
+                }
+            }
+            let _ = write_half.close().await;
+        });
+
+        let handle = self.next_handle;
+        self.next_handle = self.next_handle.saturating_add(1);
+        self.connections.insert(
+            handle,
+            WsConnection {
+                write_tx,
+                incoming_rx,
+                read_task,
+                write_task,
+            },
+        );
+        Ok(handle)
+    }
+
+    async fn send_text(&mut self, handle: u32, text: String) -> Result<(), String> {
+        let conn = self
+            .connections
+            .get(&handle)
+            .ok_or_else(|| format!("Unknown WebSocket handle: {handle}"))?;
+
+        conn.write_tx
+            .send(WsMessage::Text(text.into()))
+            .map_err(|e| format!("WebSocket send failed: {e}"))
+    }
+
+    async fn recv_text(
+        &mut self,
+        handle: u32,
+        timeout_ms: Option<u32>,
+    ) -> Result<Option<String>, String> {
+        let conn = self
+            .connections
+            .get_mut(&handle)
+            .ok_or_else(|| format!("Unknown WebSocket handle: {handle}"))?;
+
+        let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000).min(300_000) as u64);
+        match tokio::time::timeout(timeout, conn.incoming_rx.recv()).await {
+            Ok(Some(text)) => Ok(Some(text)),
+            Ok(None) => Err("WebSocket closed by peer".to_string()),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn close(&mut self, handle: u32) -> Result<(), String> {
+        if let Some(conn) = self.connections.remove(&handle) {
+            let _ = conn.write_tx.send(WsMessage::Close(None));
+            conn.read_task.abort();
+            conn.write_task.abort();
+            Ok(())
+        } else {
+            Err(format!("Unknown WebSocket handle: {handle}"))
+        }
+    }
 }
 
 impl ChannelStoreData {
+    fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic payload".to_string()
+        }
+    }
+
+    fn ensure_rustls_crypto_provider() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+    }
+
+    fn run_ws_op<T, F>(&self, fut: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = Result<T, String>> + Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.tokio_handle.spawn(async move {
+            let _ = tx.send(fut.await);
+        });
+        rx.recv()
+            .map_err(|_| "WebSocket task cancelled before completion".to_string())?
+    }
+
     fn new(
         memory_limit: u64,
         channel_name: &str,
         capabilities: ChannelCapabilities,
         credentials: HashMap<String, String>,
         pairing_store: Arc<PairingStore>,
+        ws_manager: Arc<tokio::sync::Mutex<WsConnectionManager>>,
+        tokio_handle: tokio::runtime::Handle,
     ) -> Self {
         // Create a minimal WASI context (no filesystem, no env vars for security)
         let wasi = WasiCtxBuilder::new().build();
@@ -101,7 +260,8 @@ impl ChannelStoreData {
             table: ResourceTable::new(),
             credentials,
             pairing_store,
-            http_runtime: None,
+            tokio_handle,
+            ws_manager,
         }
     }
 
@@ -289,21 +449,7 @@ impl near::agent::channel_host::Host for ChannelStoreData {
             .map(|h| h.max_response_bytes)
             .unwrap_or(10 * 1024 * 1024);
 
-        // Make the HTTP request using a dedicated single-threaded runtime.
-        // We're inside spawn_blocking, so we can't rely on the main runtime's
-        // I/O driver (it may be busy with WASM compilation or other startup work).
-        // A dedicated runtime gives us our own I/O driver and avoids contention.
-        // The runtime is lazily created and reused across calls within one execution.
-        if self.http_runtime.is_none() {
-            self.http_runtime = Some(
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| format!("Failed to create HTTP runtime: {e}"))?,
-            );
-        }
-        let rt = self.http_runtime.as_ref().expect("just initialized");
-        let result = rt.block_on(async {
+        let result = self.tokio_handle.block_on(async {
             let client = reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
@@ -425,6 +571,119 @@ impl near::agent::channel_host::Host for ChannelStoreData {
         }
 
         result
+    }
+
+    fn ws_connect(&mut self, url: String, headers_json: String) -> Result<u32, String> {
+        Self::ensure_rustls_crypto_provider();
+        let injected_url = self.inject_credentials(&url, "ws_url");
+        tracing::info!(url = %injected_url, "WASM ws_connect called");
+        self.host_state
+            .check_http_allowed(&injected_url, "GET")
+            .map_err(|e| format!("WebSocket URL not allowed: {e}"))?;
+        self.host_state
+            .record_http_request()
+            .map_err(|e| format!("WebSocket rate limit exceeded: {e}"))?;
+
+        let raw_headers: std::collections::HashMap<String, String> =
+            serde_json::from_str(&headers_json).unwrap_or_default();
+        let headers: std::collections::HashMap<String, String> = raw_headers
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    self.inject_credentials(&v, &format!("ws_header:{k}")),
+                )
+            })
+            .collect();
+
+        let manager = Arc::clone(&self.ws_manager);
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            self.run_ws_op(async move {
+                let mut guard = manager.lock().await;
+                guard.connect(&injected_url, &headers).await
+            })
+        }));
+        match result {
+            Ok(inner) => {
+                let mapped = inner.map_err(|e| self.redact_credentials(&e));
+                match &mapped {
+                    Ok(handle) => tracing::info!(handle = *handle, "WASM ws_connect ok"),
+                    Err(e) => tracing::warn!(error = %e, "WASM ws_connect error"),
+                }
+                mapped
+            }
+            Err(payload) => Err(format!(
+                "WebSocket connect panicked: {}",
+                Self::panic_payload_to_string(payload)
+            )),
+        }
+    }
+
+    fn ws_send(&mut self, handle: u32, text: String) -> Result<(), String> {
+        let payload = self.inject_credentials(&text, "ws_send");
+        tracing::debug!(handle = handle, len = payload.len(), "WASM ws_send called");
+
+        let manager = Arc::clone(&self.ws_manager);
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            self.run_ws_op(async move {
+                let mut guard = manager.lock().await;
+                guard.send_text(handle, payload).await
+            })
+        }));
+        match result {
+            Ok(inner) => {
+                let mapped = inner.map_err(|e| self.redact_credentials(&e));
+                if let Err(e) = &mapped {
+                    tracing::warn!(handle = handle, error = %e, "WASM ws_send error");
+                }
+                mapped
+            }
+            Err(payload) => Err(format!(
+                "WebSocket send panicked: {}",
+                Self::panic_payload_to_string(payload)
+            )),
+        }
+    }
+
+    fn ws_recv(&mut self, handle: u32, timeout_ms: Option<u32>) -> Result<Option<String>, String> {
+        tracing::debug!(handle = handle, timeout_ms = ?timeout_ms, "WASM ws_recv called");
+        let manager = Arc::clone(&self.ws_manager);
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            self.run_ws_op(async move {
+                let mut guard = manager.lock().await;
+                guard.recv_text(handle, timeout_ms).await
+            })
+        }));
+        match result {
+            Ok(inner) => {
+                let mapped = inner.map_err(|e| self.redact_credentials(&e));
+                if let Err(e) = &mapped {
+                    tracing::warn!(handle = handle, error = %e, "WASM ws_recv error");
+                }
+                mapped
+            }
+            Err(payload) => Err(format!(
+                "WebSocket receive panicked: {}",
+                Self::panic_payload_to_string(payload)
+            )),
+        }
+    }
+
+    fn ws_close(&mut self, handle: u32) -> Result<(), String> {
+        let manager = Arc::clone(&self.ws_manager);
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            self.run_ws_op(async move {
+                let mut guard = manager.lock().await;
+                guard.close(handle).await
+            })
+        }));
+        match result {
+            Ok(inner) => inner.map_err(|e| self.redact_credentials(&e)),
+            Err(payload) => Err(format!(
+                "WebSocket close panicked: {}",
+                Self::panic_payload_to_string(payload)
+            )),
+        }
     }
 
     fn secret_exists(&mut self, name: String) -> bool {
@@ -550,6 +809,12 @@ pub struct WasmChannel {
     /// Pairing store for DM pairing (guest access control).
     pairing_store: Arc<PairingStore>,
 
+    /// Shared WebSocket connection manager for host-provided ws_* APIs.
+    ws_manager: Arc<tokio::sync::Mutex<WsConnectionManager>>,
+
+    /// Push wakeups for channels that receive event-driven network data.
+    poll_notify: Arc<Notify>,
+
     /// In-memory workspace store persisting writes across callback invocations.
     /// Ensures WASM channels can maintain state (e.g., polling offsets) between ticks.
     workspace_store: Arc<ChannelWorkspaceStore>,
@@ -566,6 +831,7 @@ impl WasmChannel {
     ) -> Self {
         let name = prepared.name.clone();
         let rate_limiter = ChannelEmitRateLimiter::new(capabilities.emit_rate_limit.clone());
+        let poll_notify = Arc::new(Notify::new());
 
         Self {
             name,
@@ -583,6 +849,10 @@ impl WasmChannel {
             credentials: Arc::new(RwLock::new(HashMap::new())),
             typing_task: RwLock::new(None),
             pairing_store,
+            ws_manager: Arc::new(tokio::sync::Mutex::new(WsConnectionManager::new(
+                Arc::clone(&poll_notify),
+            ))),
+            poll_notify,
             workspace_store: Arc::new(ChannelWorkspaceStore::new()),
         }
     }
@@ -686,6 +956,8 @@ impl WasmChannel {
         capabilities: &ChannelCapabilities,
         credentials: HashMap<String, String>,
         pairing_store: Arc<PairingStore>,
+        ws_manager: Arc<tokio::sync::Mutex<WsConnectionManager>>,
+        tokio_handle: tokio::runtime::Handle,
     ) -> Result<Store<ChannelStoreData>, WasmChannelError> {
         let engine = runtime.engine();
         let limits = &prepared.limits;
@@ -697,6 +969,8 @@ impl WasmChannel {
             capabilities.clone(),
             credentials,
             pairing_store,
+            ws_manager,
+            tokio_handle,
         );
         let mut store = Store::new(engine, store_data);
 
@@ -807,6 +1081,8 @@ impl WasmChannel {
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
         let pairing_store = self.pairing_store.clone();
+        let ws_manager = self.ws_manager.clone();
+        let tokio_handle = tokio::runtime::Handle::current();
         let workspace_store = self.workspace_store.clone();
 
         // Execute in blocking task with timeout
@@ -818,6 +1094,8 @@ impl WasmChannel {
                     &capabilities,
                     credentials,
                     pairing_store,
+                    ws_manager,
+                    tokio_handle,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -866,7 +1144,11 @@ impl WasmChannel {
                         crate::tools::wasm::LogLevel::Warn => {
                             tracing::warn!(channel = %self.name, "{}", entry.message);
                         }
-                        _ => {
+                        crate::tools::wasm::LogLevel::Info => {
+                            tracing::info!(channel = %self.name, "{}", entry.message);
+                        }
+                        crate::tools::wasm::LogLevel::Debug
+                        | crate::tools::wasm::LogLevel::Trace => {
                             tracing::debug!(channel = %self.name, "{}", entry.message);
                         }
                     }
@@ -943,6 +1225,8 @@ impl WasmChannel {
         let timeout = self.runtime.config().callback_timeout;
         let credentials = self.get_credentials().await;
         let pairing_store = self.pairing_store.clone();
+        let ws_manager = self.ws_manager.clone();
+        let tokio_handle = tokio::runtime::Handle::current();
         let workspace_store = self.workspace_store.clone();
 
         // Prepare request data
@@ -963,6 +1247,8 @@ impl WasmChannel {
                     &capabilities,
                     credentials,
                     pairing_store,
+                    ws_manager,
+                    tokio_handle,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -1042,6 +1328,8 @@ impl WasmChannel {
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
         let pairing_store = self.pairing_store.clone();
+        let ws_manager = self.ws_manager.clone();
+        let tokio_handle = tokio::runtime::Handle::current();
         let workspace_store = self.workspace_store.clone();
 
         // Execute in blocking task with timeout
@@ -1053,6 +1341,8 @@ impl WasmChannel {
                     &capabilities,
                     credentials,
                     pairing_store,
+                    ws_manager,
+                    tokio_handle,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -1085,6 +1375,25 @@ impl WasmChannel {
                 // Process emitted messages
                 let emitted = host_state.take_emitted_messages();
                 self.process_emitted_messages(emitted).await?;
+
+                // Surface guest logs emitted during on_poll.
+                for entry in host_state.take_logs() {
+                    match entry.level {
+                        crate::tools::wasm::LogLevel::Error => {
+                            tracing::error!(channel = %self.name, "{}", entry.message);
+                        }
+                        crate::tools::wasm::LogLevel::Warn => {
+                            tracing::warn!(channel = %self.name, "{}", entry.message);
+                        }
+                        crate::tools::wasm::LogLevel::Info => {
+                            tracing::info!(channel = %self.name, "{}", entry.message);
+                        }
+                        crate::tools::wasm::LogLevel::Debug
+                        | crate::tools::wasm::LogLevel::Trace => {
+                            tracing::debug!(channel = %self.name, "{}", entry.message);
+                        }
+                    }
+                }
 
                 tracing::debug!(
                     channel = %channel_name,
@@ -1143,6 +1452,8 @@ impl WasmChannel {
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
         let pairing_store = self.pairing_store.clone();
+        let ws_manager = self.ws_manager.clone();
+        let tokio_handle = tokio::runtime::Handle::current();
 
         // Prepare response data
         let message_id_str = message_id.to_string();
@@ -1162,6 +1473,8 @@ impl WasmChannel {
                     &capabilities,
                     credentials,
                     pairing_store,
+                    ws_manager,
+                    tokio_handle,
                 )?;
 
                 tracing::info!("Instantiating WASM component for on_respond");
@@ -1220,7 +1533,26 @@ impl WasmChannel {
 
         let channel_name = self.name.clone();
         match result {
-            Ok(Ok(((), _host_state))) => {
+            Ok(Ok(((), mut host_state))) => {
+                // Surface guest logs emitted during on_respond.
+                for entry in host_state.take_logs() {
+                    match entry.level {
+                        crate::tools::wasm::LogLevel::Error => {
+                            tracing::error!(channel = %self.name, "{}", entry.message);
+                        }
+                        crate::tools::wasm::LogLevel::Warn => {
+                            tracing::warn!(channel = %self.name, "{}", entry.message);
+                        }
+                        crate::tools::wasm::LogLevel::Info => {
+                            tracing::info!(channel = %self.name, "{}", entry.message);
+                        }
+                        crate::tools::wasm::LogLevel::Debug
+                        | crate::tools::wasm::LogLevel::Trace => {
+                            tracing::debug!(channel = %self.name, "{}", entry.message);
+                        }
+                    }
+                }
+
                 tracing::debug!(
                     channel = %channel_name,
                     message_id = %message_id,
@@ -1256,6 +1588,8 @@ impl WasmChannel {
         let channel_name = self.name.clone();
         let credentials = self.get_credentials().await;
         let pairing_store = self.pairing_store.clone();
+        let ws_manager = self.ws_manager.clone();
+        let tokio_handle = tokio::runtime::Handle::current();
 
         let wit_update = status_to_wit(status, metadata);
 
@@ -1267,6 +1601,8 @@ impl WasmChannel {
                     &capabilities,
                     credentials,
                     pairing_store,
+                    ws_manager,
+                    tokio_handle,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -1313,6 +1649,7 @@ impl WasmChannel {
         capabilities: &ChannelCapabilities,
         credentials: &RwLock<HashMap<String, String>>,
         pairing_store: Arc<PairingStore>,
+        ws_manager: Arc<tokio::sync::Mutex<WsConnectionManager>>,
         timeout: Duration,
         wit_update: wit_channel::StatusUpdate,
     ) -> Result<(), WasmChannelError> {
@@ -1325,6 +1662,7 @@ impl WasmChannel {
         let capabilities = capabilities.clone();
         let credentials_snapshot = credentials.read().await.clone();
         let channel_name_owned = channel_name.to_string();
+        let tokio_handle = tokio::runtime::Handle::current();
 
         let result = tokio::time::timeout(timeout, async move {
             tokio::task::spawn_blocking(move || {
@@ -1334,6 +1672,8 @@ impl WasmChannel {
                     &capabilities,
                     credentials_snapshot,
                     pairing_store,
+                    ws_manager,
+                    tokio_handle,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -1415,6 +1755,7 @@ impl WasmChannel {
                 let capabilities = self.capabilities.clone();
                 let credentials = self.credentials.clone();
                 let pairing_store = self.pairing_store.clone();
+                let ws_manager = self.ws_manager.clone();
                 let callback_timeout = self.runtime.config().callback_timeout;
                 let wit_update = status_to_wit(&status, metadata);
 
@@ -1435,6 +1776,7 @@ impl WasmChannel {
                             &capabilities,
                             &credentials,
                             pairing_store.clone(),
+                            ws_manager.clone(),
                             callback_timeout,
                             wit_update_clone,
                         )
@@ -1654,6 +1996,8 @@ impl WasmChannel {
         let rate_limiter = self.rate_limiter.clone();
         let credentials = self.credentials.clone();
         let pairing_store = self.pairing_store.clone();
+        let ws_manager = self.ws_manager.clone();
+        let poll_notify = Arc::clone(&self.poll_notify);
         let callback_timeout = self.runtime.config().callback_timeout;
         let workspace_store = self.workspace_store.clone();
 
@@ -1677,6 +2021,7 @@ impl WasmChannel {
                             &capabilities,
                             &credentials,
                             pairing_store.clone(),
+                            ws_manager.clone(),
                             callback_timeout,
                             &workspace_store,
                         ).await;
@@ -1707,6 +2052,49 @@ impl WasmChannel {
                             }
                         }
                     }
+                    _ = poll_notify.notified() => {
+                        tracing::debug!(
+                            channel = %channel_name,
+                            "Polling wakeup from push event"
+                        );
+
+                        let result = Self::execute_poll(
+                            &channel_name,
+                            &runtime,
+                            &prepared,
+                            &capabilities,
+                            &credentials,
+                            pairing_store.clone(),
+                            ws_manager.clone(),
+                            callback_timeout,
+                            &workspace_store,
+                        ).await;
+
+                        match result {
+                            Ok(emitted_messages) => {
+                                if !emitted_messages.is_empty()
+                                    && let Err(e) = Self::dispatch_emitted_messages(
+                                        &channel_name,
+                                        emitted_messages,
+                                        &message_tx,
+                                        &rate_limiter,
+                                    ).await {
+                                        tracing::warn!(
+                                            channel = %channel_name,
+                                            error = %e,
+                                            "Failed to dispatch emitted messages from push wake"
+                                        );
+                                    }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    channel = %channel_name,
+                                    error = %e,
+                                    "Push-triggered polling callback failed"
+                                );
+                            }
+                        }
+                    }
                     _ = &mut shutdown => {
                         tracing::info!(
                             channel = %channel_name,
@@ -1732,6 +2120,7 @@ impl WasmChannel {
         capabilities: &ChannelCapabilities,
         credentials: &RwLock<HashMap<String, String>>,
         pairing_store: Arc<PairingStore>,
+        ws_manager: Arc<tokio::sync::Mutex<WsConnectionManager>>,
         timeout: Duration,
         workspace_store: &Arc<ChannelWorkspaceStore>,
     ) -> Result<Vec<EmittedMessage>, WasmChannelError> {
@@ -1750,6 +2139,7 @@ impl WasmChannel {
         let credentials_snapshot = credentials.read().await.clone();
         let channel_name_owned = channel_name.to_string();
         let workspace_store = Arc::clone(workspace_store);
+        let tokio_handle = tokio::runtime::Handle::current();
 
         // Execute in blocking task with timeout
         let result = tokio::time::timeout(timeout, async move {
@@ -1760,6 +2150,8 @@ impl WasmChannel {
                     &capabilities,
                     credentials_snapshot,
                     pairing_store,
+                    ws_manager,
+                    tokio_handle,
                 )?;
                 let instance = Self::instantiate_component(&runtime, &prepared, &mut store)?;
 
@@ -1788,6 +2180,25 @@ impl WasmChannel {
 
         match result {
             Ok(Ok(mut host_state)) => {
+                // Surface guest logs emitted during poll execution.
+                for entry in host_state.take_logs() {
+                    match entry.level {
+                        crate::tools::wasm::LogLevel::Error => {
+                            tracing::error!(channel = %channel_name, "{}", entry.message);
+                        }
+                        crate::tools::wasm::LogLevel::Warn => {
+                            tracing::warn!(channel = %channel_name, "{}", entry.message);
+                        }
+                        crate::tools::wasm::LogLevel::Info => {
+                            tracing::info!(channel = %channel_name, "{}", entry.message);
+                        }
+                        crate::tools::wasm::LogLevel::Debug
+                        | crate::tools::wasm::LogLevel::Trace => {
+                            tracing::debug!(channel = %channel_name, "{}", entry.message);
+                        }
+                    }
+                }
+
                 let emitted = host_state.take_emitted_messages();
                 tracing::debug!(
                     channel = %channel_name,
@@ -2355,6 +2766,7 @@ impl HttpResponse {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use tokio::sync::Notify;
 
     use crate::channels::Channel;
     use crate::channels::wasm::capabilities::ChannelCapabilities;
@@ -2454,6 +2866,9 @@ mod tests {
         let timeout = std::time::Duration::from_secs(5);
 
         let workspace_store = Arc::new(crate::channels::wasm::host::ChannelWorkspaceStore::new());
+        let ws_manager = Arc::new(tokio::sync::Mutex::new(super::WsConnectionManager::new(
+            Arc::new(Notify::new()),
+        )));
 
         let result = WasmChannel::execute_poll(
             "poll-test",
@@ -2462,6 +2877,7 @@ mod tests {
             &capabilities,
             &credentials,
             Arc::new(PairingStore::new()),
+            ws_manager,
             timeout,
             &workspace_store,
         )
@@ -3310,6 +3726,15 @@ mod tests {
             ChannelCapabilities::default(),
             creds,
             Arc::new(PairingStore::new()),
+            Arc::new(tokio::sync::Mutex::new(super::WsConnectionManager::new(
+                Arc::new(Notify::new()),
+            ))),
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime")
+                .handle()
+                .clone(),
         );
 
         let error = "HTTP request failed: error sending request for url \
@@ -3341,6 +3766,15 @@ mod tests {
             ChannelCapabilities::default(),
             std::collections::HashMap::new(),
             Arc::new(PairingStore::new()),
+            Arc::new(tokio::sync::Mutex::new(super::WsConnectionManager::new(
+                Arc::new(Notify::new()),
+            ))),
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime")
+                .handle()
+                .clone(),
         );
 
         let input = "some error message";
@@ -3360,6 +3794,15 @@ mod tests {
             ChannelCapabilities::default(),
             creds,
             Arc::new(PairingStore::new()),
+            Arc::new(tokio::sync::Mutex::new(super::WsConnectionManager::new(
+                Arc::new(Notify::new()),
+            ))),
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime")
+                .handle()
+                .clone(),
         );
 
         let input = "should not match anything";

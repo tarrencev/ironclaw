@@ -195,6 +195,7 @@ const SAFE_ENV_VARS: &[&str] = &[
     "WINDIR",
 ];
 
+
 /// Check whether a shell command contains patterns that must never be auto-approved.
 ///
 /// Even when the user has chosen "always approve" for the shell tool, these commands
@@ -204,6 +205,40 @@ pub fn requires_explicit_approval(command: &str) -> bool {
     NEVER_AUTO_APPROVE_PATTERNS
         .iter()
         .any(|p| lower.contains(&p.to_lowercase()))
+}
+
+fn scoped_env_vars_for_command(command: &str) -> Vec<String> {
+    let cmd = command.trim_start().to_ascii_lowercase();
+    let rules = std::env::var("SHELL_ENV_PASSTHROUGH_RULES").unwrap_or_default();
+    let mut out = Vec::new();
+    for raw_rule in rules.split(';') {
+        let rule = raw_rule.trim();
+        if rule.is_empty() {
+            continue;
+        }
+        let Some((prefix_raw, vars_raw)) = rule.split_once(':') else {
+            continue;
+        };
+        let prefix = prefix_raw.trim().to_ascii_lowercase();
+        if prefix.is_empty() || !command_matches_prefix(&cmd, &prefix) {
+            continue;
+        }
+        for var in vars_raw.split('|') {
+            let name = var.trim();
+            if !name.is_empty() {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn command_matches_prefix(cmd: &str, prefix: &str) -> bool {
+    if cmd == prefix {
+        return true;
+    }
+    cmd.strip_prefix(prefix)
+        .is_some_and(|rest| rest.starts_with(char::is_whitespace))
 }
 
 /// Detect command injection and obfuscation attempts.
@@ -497,6 +532,14 @@ impl ShellTool {
         // worker runtime) on top of the scrubbed base. These are explicitly
         // provided by the orchestrator and are safe to forward.
         command.envs(extra_env);
+
+        // Command-scoped secret passthrough from runtime rules.
+        // Format: SHELL_ENV_PASSTHROUGH_RULES="prefix:VAR1|VAR2;otherprefix:VAR3"
+        for var in scoped_env_vars_for_command(cmd) {
+            if let Ok(val) = std::env::var(&var) {
+                command.env(&var, val);
+            }
+        }
 
         command
             .current_dir(workdir)
@@ -1199,6 +1242,47 @@ mod tests {
         for (name, _) in &secrets {
             unsafe { std::env::remove_var(name) };
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mercury_command_gets_mercury_token_only_for_mercury_cli() {
+        // SAFETY: test-only, single-threaded tokio runtime, no concurrent env access.
+        unsafe {
+            std::env::set_var("SHELL_ENV_PASSTHROUGH_RULES", "mercury:MERCURY_TOKEN");
+        }
+        // SAFETY: test-only, single-threaded tokio runtime, no concurrent env access.
+        unsafe { std::env::set_var("MERCURY_TOKEN", "mercury_test_token_123") };
+
+        let tool = ShellTool::new();
+        let ctx = JobContext::default();
+
+        // This starts with "mercury", so command-scoped passthrough should occur.
+        // The mercury binary may not exist in CI, so we continue to echo token presence.
+        let result = tool
+            .execute(
+                serde_json::json!({"command": "mercury version >/dev/null 2>&1; echo ${MERCURY_TOKEN:+set}"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let output = result.result.get("output").unwrap().as_str().unwrap();
+        assert!(output.contains("set"), "MERCURY_TOKEN should be present for mercury commands");
+
+        let non_mercury = tool
+            .execute(serde_json::json!({"command": "echo ${MERCURY_TOKEN:+set}"}), &ctx)
+            .await
+            .unwrap();
+        let non_mercury_output = non_mercury.result.get("output").unwrap().as_str().unwrap();
+        assert!(
+            !non_mercury_output.contains("set"),
+            "MERCURY_TOKEN should not be passed to non-mercury shell commands"
+        );
+
+        // SAFETY: test-only, single-threaded tokio runtime.
+        unsafe { std::env::remove_var("MERCURY_TOKEN") };
+        // SAFETY: test-only, single-threaded tokio runtime.
+        unsafe { std::env::remove_var("SHELL_ENV_PASSTHROUGH_RULES") };
     }
 
     // ── Integration: injection blocked at execute_command level ─────────

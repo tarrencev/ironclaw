@@ -103,6 +103,38 @@ interface channel-host {
         timeout-ms: option<u32>,
     ) -> result<http-response, string>;
 
+    /// Open a WebSocket connection (if HTTP capability is granted).
+    ///
+    /// Security:
+    /// - URL must pass channel allowlist validation
+    /// - Credentials may be injected into URL and headers by the host
+    /// - Returns an opaque connection handle scoped to this channel runtime
+    ws-connect: func(
+        url: string,
+        headers-json: string
+    ) -> result<u32, string>;
+
+    /// Send a UTF-8 text frame over an existing WebSocket connection.
+    ///
+    /// Returns error if the handle is unknown or the connection is closed.
+    ws-send: func(
+        handle: u32,
+        text: string
+    ) -> result<_, string>;
+
+    /// Receive the next UTF-8 text frame from an existing WebSocket connection.
+    ///
+    /// - Returns `ok(none)` on timeout
+    /// - Returns `ok(some(text))` when a text frame is received
+    /// - Non-text protocol frames are handled internally by the host
+    ws-recv: func(
+        handle: u32,
+        timeout-ms: option<u32>
+    ) -> result<option<string>, string>;
+
+    /// Close a WebSocket connection and release its handle.
+    ws-close: func(handle: u32) -> result<_, string>;
+
     /// Check if a secret exists (if capability granted).
     ///
     /// Security:
